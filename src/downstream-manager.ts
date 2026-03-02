@@ -190,6 +190,18 @@ export class DownstreamManager {
             }
         }
 
+        logger.info('Spawning downstream MCP process', {
+            key: normalizedKey,
+            command: 'npx',
+            args,
+            env: {
+                AZURE_TOKEN_CREDENTIALS: env['AZURE_TOKEN_CREDENTIALS'] ?? '(not set)',
+                AZURE_CLIENT_ID: env['AZURE_CLIENT_ID'] ?? '(not set)',
+                IDENTITY_ENDPOINT: env['IDENTITY_ENDPOINT'] ? '(set)' : '(not set)',
+                IDENTITY_HEADER: env['IDENTITY_HEADER'] ? '(set)' : '(not set)',
+            },
+        });
+
         const transport = new StdioClientTransport({
             command: 'npx',
             args,
