@@ -3,19 +3,23 @@
 /**
  * @sreagent/mcp-router
  *
- * MCP server that routes tool calls to multiple downstream @azure/mcp
- * instances based on endpoint URL. Each downstream is spawned as a child process
- * running `npx -y @azure/mcp@latest server start --namespace <ns>`.
+ * Generic MCP server that routes tool calls to multiple downstream @azure/mcp
+ * instances. Each downstream is spawned as a child process running
+ * `npx -y @azure/mcp@latest server start --namespace <ns>`.
  *
- * Usage:
- *   npx @sreagent/mcp-router \
- *     --mapping https://endpoint1=/sub/.../id1 \
- *     --mapping https://endpoint2=/sub/.../id2
+ * Supports two modes:
+ * 1. CLI flags (single group):
+ *    mcp-router --namespace kusto --routing-key cluster \
+ *      --mapping https://cluster1=identity1
+ *
+ * 2. Config file (multiple groups):
+ *    mcp-router --config router-config.json
  *
  * The server communicates over stdio (stdin/stdout) using the MCP protocol.
  * Logs are written to stderr.
  */
 
+import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import { DownstreamManager } from './downstream-manager.js';
 import { ToolRouter } from './tool-router.js';
@@ -23,31 +27,71 @@ import { HealthMonitor } from './health-monitor.js';
 import { createAndStartServer } from './server.js';
 import { registerShutdownHandlers } from './lifecycle.js';
 import { logger, setLogLevel, enableFileLogging } from './logger.js';
-import type { ClusterMapping, RouterConfig } from './types.js';
+import type { DownstreamMapping, DownstreamGroupConfig, RouterConfig } from './types.js';
 
 /**
- * Parse a --mapping value: "clusterUrl=identityResourceId" or "clusterUrl" (no identity).
+ * Parse a --mapping value: "key=identity" or "key" (no identity).
  */
-function parseMapping(value: string, previous: ClusterMapping[]): ClusterMapping[] {
+export function parseMapping(value: string, previous: DownstreamMapping[]): DownstreamMapping[] {
     const eqIndex = value.indexOf('=');
-    let clusterUrl: string;
+    let key: string;
     let identity: string;
 
     if (eqIndex === -1) {
         // No identity — use default
-        clusterUrl = value;
+        key = value;
         identity = '';
     } else {
-        clusterUrl = value.substring(0, eqIndex);
+        key = value.substring(0, eqIndex);
         identity = value.substring(eqIndex + 1);
     }
 
-    if (!clusterUrl) {
-        throw new Error(`Invalid mapping: "${value}". Expected format: clusterUrl=identity or clusterUrl`);
+    if (!key) {
+        throw new Error(`Invalid mapping: "${value}". Expected format: key=identity or key`);
     }
 
-    previous.push({ clusterUrl, identity });
+    previous.push({ key, identity });
     return previous;
+}
+
+/**
+ * Load and validate a config file.
+ */
+function loadConfigFile(configPath: string): RouterConfig {
+    const raw = readFileSync(configPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+
+    if (!parsed.groups || !Array.isArray(parsed.groups) || parsed.groups.length === 0) {
+        throw new Error('Config file must contain a non-empty "groups" array.');
+    }
+
+    for (const group of parsed.groups) {
+        if (!group.namespace) {
+            throw new Error('Each group must have a "namespace" field.');
+        }
+        if (!group.routingKey) {
+            throw new Error(`Group "${group.namespace}" must have a "routingKey" field.`);
+        }
+        if (!group.downstreams || !Array.isArray(group.downstreams) || group.downstreams.length === 0) {
+            throw new Error(`Group "${group.namespace}" must have a non-empty "downstreams" array.`);
+        }
+        for (const ds of group.downstreams) {
+            if (!ds.key) {
+                throw new Error(`Each downstream in group "${group.namespace}" must have a "key" field.`);
+            }
+            if (ds.identity === undefined) {
+                ds.identity = '';
+            }
+        }
+    }
+
+    return {
+        groups: parsed.groups as DownstreamGroupConfig[],
+        pingIntervalSeconds: parsed.pingIntervalSeconds ?? 60,
+        pingTimeoutSeconds: parsed.pingTimeoutSeconds ?? 10,
+        maxReconnectBackoffSeconds: parsed.maxReconnectBackoffSeconds ?? 300,
+        logLevel: parsed.logLevel ?? 'info',
+    };
 }
 
 async function main(): Promise<void> {
@@ -56,18 +100,42 @@ async function main(): Promise<void> {
     program
         .name('mcp-router')
         .description(
-            'MCP server that routes tool calls to multiple downstream @azure/mcp instances'
+            'Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances'
         )
         .version('1.0.0')
-        .requiredOption(
+        .option(
+            '--config <path>',
+            'Path to a JSON config file defining downstream groups'
+        )
+        .option(
+            '--namespace <namespace>',
+            '@azure/mcp namespace for CLI mode (e.g. "kusto", "cosmos")',
+            'kusto'
+        )
+        .option(
+            '--routing-key <key>',
+            'Tool schema property name used for routing (e.g. "cluster-uri", "account")',
+            'cluster-uri'
+        )
+        .option(
+            '--forward-key-as <key>',
+            'Rename the routing key when forwarding to the downstream. ' +
+            'E.g., --routing-key account --forward-key-as accountName'
+        )
+        .option(
             '--mapping <mapping>',
-            'Cluster-to-identity mapping in format "clusterUrl=identity". ' +
-            'Can be specified multiple times for multiple clusters. ' +
+            'Downstream mapping in format "key=identity" (CLI mode). ' +
+            'Can be specified multiple times. ' +
             'If identity is omitted, uses the default managed identity.',
             parseMapping,
-            [] as ClusterMapping[]
+            [] as DownstreamMapping[]
         )
-        .option('--read-only', 'Run downstream MCPs in read-only mode', true)
+        .option(
+            '--mode <mode>',
+            '@azure/mcp --mode value (CLI mode)',
+            'all'
+        )
+        .option('--read-only', 'Run downstream MCPs in read-only mode (CLI mode)', true)
         .option('--no-read-only', 'Allow write operations on downstream MCPs')
         .option(
             '--ping-interval <seconds>',
@@ -92,30 +160,61 @@ async function main(): Promise<void> {
         .parse(process.argv);
 
     const opts = program.opts();
-    const mappings = opts.mapping as ClusterMapping[];
 
-    if (mappings.length === 0) {
-        logger.error(
-            'No cluster mappings provided. Use --mapping to specify at least one cluster.'
-        );
-        process.exit(1);
+    let config: RouterConfig;
+
+    if (opts.config) {
+        // Config file mode — load from JSON
+        try {
+            config = loadConfigFile(opts.config as string);
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            logger.error(`Failed to load config file: ${msg}`);
+            process.exit(1);
+        }
+
+        // CLI overrides for log level and health settings
+        if (opts.logLevel !== 'info') {
+            config.logLevel = opts.logLevel as RouterConfig['logLevel'];
+        }
+    } else {
+        // CLI flags mode — build a single group from flags
+        const mappings = opts.mapping as DownstreamMapping[];
+
+        if (mappings.length === 0) {
+            logger.error(
+                'No downstream mappings provided. Use --mapping or --config.'
+            );
+            process.exit(1);
+        }
+
+        const group: DownstreamGroupConfig = {
+            namespace: opts.namespace as string,
+            routingKey: opts.routingKey as string,
+            forwardKeyAs: opts.forwardKeyAs as string | undefined,
+            mode: opts.mode as string,
+            readOnly: opts.readOnly as boolean,
+            downstreams: mappings,
+        };
+
+        config = {
+            groups: [group],
+            pingIntervalSeconds: parseInt(opts.pingInterval as string, 10),
+            pingTimeoutSeconds: parseInt(opts.pingTimeout as string, 10),
+            maxReconnectBackoffSeconds: parseInt(opts.maxReconnectBackoff as string, 10),
+            logLevel: opts.logLevel as RouterConfig['logLevel'],
+        };
     }
-
-    const config: RouterConfig = {
-        mappings,
-        readOnly: opts.readOnly as boolean,
-        pingIntervalSeconds: parseInt(opts.pingInterval as string, 10),
-        pingTimeoutSeconds: parseInt(opts.pingTimeout as string, 10),
-        maxReconnectBackoffSeconds: parseInt(opts.maxReconnectBackoff as string, 10),
-        logLevel: opts.logLevel as RouterConfig['logLevel'],
-    };
 
     setLogLevel(config.logLevel);
     enableFileLogging();
 
     logger.info('Starting MCP Router', {
-        clusters: config.mappings.map((m) => m.clusterUrl),
-        readOnly: config.readOnly,
+        groups: config.groups.map((g) => ({
+            namespace: g.namespace,
+            routingKey: g.routingKey,
+            downstreams: g.downstreams.map((d) => d.key),
+        })),
         pingIntervalSeconds: config.pingIntervalSeconds,
     });
 
@@ -162,7 +261,7 @@ async function main(): Promise<void> {
     });
 
     logger.info('MCP Router is ready', {
-        clusters: downstreamManager.getClusterUrls(),
+        downstreams: downstreamManager.getDownstreamKeys(),
         tools: tools.map((t) => t.name),
         connectedDownstreams: connectedCount,
     });

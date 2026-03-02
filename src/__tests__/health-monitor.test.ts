@@ -12,15 +12,14 @@ function createMockDownstreamManager(connections: DownstreamConnection[]): Downs
         getConnections: vi.fn(() => connections),
         ping: vi.fn(async () => true),
         reconnect: vi.fn(async () => true),
-        getClusterUrls: vi.fn(() => connections.map((c) => c.clusterUrl)),
+        getDownstreamKeys: vi.fn(() => connections.map((c) => c.key)),
         shutdownAll: vi.fn(async () => {}),
         onDownstreamExit: vi.fn(),
     } as unknown as DownstreamManager;
 }
 
 const DEFAULT_CONFIG: RouterConfig = {
-    mappings: [],
-    readOnly: true,
+    groups: [],
     pingIntervalSeconds: 1, // 1 second for tests
     pingTimeoutSeconds: 5,
     maxReconnectBackoffSeconds: 10,
@@ -72,7 +71,8 @@ describe('HealthMonitor', () => {
         it('pings connected downstreams', async () => {
             const connections: DownstreamConnection[] = [
                 {
-                    clusterUrl: 'https://cluster1.kusto.windows.net',
+                    key: 'https://cluster1.kusto.windows.net',
+                    group: 'kusto',
                     identity: 'id1',
                     status: 'Connected',
                     lastHeartbeat: new Date().toISOString(),
@@ -97,7 +97,8 @@ describe('HealthMonitor', () => {
         it('schedules reconnection for failed downstreams', async () => {
             const connections: DownstreamConnection[] = [
                 {
-                    clusterUrl: 'https://cluster1.kusto.windows.net',
+                    key: 'https://cluster1.kusto.windows.net',
+                    group: 'kusto',
                     identity: 'id1',
                     status: 'Failed',
                     lastHeartbeat: null,

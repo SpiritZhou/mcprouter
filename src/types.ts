@@ -1,14 +1,40 @@
 /**
- * Types for the Kusto MCP Router.
+ * Types for the generic MCP Router.
  */
 
 /**
- * A mapping from a Kusto cluster URL to an identity resource ID.
+ * Configuration for a group of downstream MCP servers sharing the same namespace.
+ * Each group defines how to spawn child processes and which property to use for routing.
  */
-export interface ClusterMapping {
-    /** Kusto cluster URL, e.g. "https://mycluster.kusto.windows.net" */
-    clusterUrl: string;
-    /** UAMI resource ID or empty string if using default identity */
+export interface DownstreamGroupConfig {
+    /** @azure/mcp namespace (e.g. "kusto", "cosmos") */
+    namespace: string;
+    /** The tool schema property name used for routing (e.g. "cluster", "account") */
+    routingKey: string;
+    /**
+     * When forwarding the routing key value to the downstream, use this property name instead.
+     * Useful when the downstream expects a different parameter name than the one exposed in the schema.
+     * E.g., routing on "account" but forwarding as "accountName".
+     * Defaults to the same as routingKey if not specified.
+     */
+    forwardKeyAs?: string;
+    /** @azure/mcp --mode value (default: "all") */
+    mode?: string;
+    /** Whether downstream MCPs in this group should run in read-only mode */
+    readOnly?: boolean;
+    /** Downstream instances in this group */
+    downstreams: DownstreamMapping[];
+}
+
+/**
+ * A mapping from a routing key value to an identity resource ID.
+ * The key is an opaque identifier (URL, name, region:account, etc.) that matches
+ * the routing key property value in tool calls.
+ */
+export interface DownstreamMapping {
+    /** Opaque routing key value, e.g. "https://mycluster.kusto.windows.net", "eastus:myaccount" */
+    key: string;
+    /** UAMI resource ID, client ID, or empty string if using default identity */
     identity: string;
 }
 
@@ -18,11 +44,13 @@ export interface ClusterMapping {
 export type ConnectionStatus = 'Connected' | 'Connecting' | 'Failed' | 'Disconnected';
 
 /**
- * Represents a downstream @azure/mcp Kusto MCP server instance.
+ * Represents a downstream @azure/mcp server instance.
  */
 export interface DownstreamConnection {
-    /** Normalized cluster URL */
-    clusterUrl: string;
+    /** Normalized downstream key (opaque routing value) */
+    key: string;
+    /** Group namespace this downstream belongs to */
+    group: string;
     /** Identity resource ID */
     identity: string;
     /** Current connection status */
@@ -86,13 +114,11 @@ export interface ToolContent {
 }
 
 /**
- * CLI configuration parsed from command-line arguments.
+ * CLI configuration parsed from command-line arguments or config file.
  */
 export interface RouterConfig {
-    /** Cluster-to-identity mappings */
-    mappings: ClusterMapping[];
-    /** Whether downstream Kusto MCPs should run in read-only mode */
-    readOnly: boolean;
+    /** Downstream groups — each group defines a namespace, routing key, and downstream instances */
+    groups: DownstreamGroupConfig[];
     /** Health check ping interval in seconds */
     pingIntervalSeconds: number;
     /** Health check ping timeout in seconds */

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 // src/index.ts
+import { readFileSync } from "fs";
 import { Command } from "commander";
 
 // src/downstream-manager.ts
@@ -82,13 +83,8 @@ var logger = {
 };
 
 // src/downstream-manager.ts
-function normalizeClusterUrl(url) {
-  let normalized = url.trim().toLowerCase();
-  if (!normalized.startsWith("https://") && !normalized.startsWith("http://")) {
-    normalized = `https://${normalized}`;
-  }
-  normalized = normalized.replace(/\/+$/, "");
-  return normalized;
+function normalizeKey(key) {
+  return key.trim().toLowerCase();
 }
 function extractClientIdFromIdentity(identity) {
   const trimmed = identity.trim();
@@ -110,39 +106,48 @@ var DownstreamManager = class {
     this._onDownstreamExit = callback;
   }
   /**
-   * Initialize all downstream connections.
+   * Initialize all downstream connections across all groups.
    * Spawns child processes and discovers tools from each.
    */
   async initializeAll() {
-    const initPromises = this._config.mappings.map(async (mapping) => {
-      const key = normalizeClusterUrl(mapping.clusterUrl);
-      if (this._downstreams.has(key)) {
-        logger.warn(`Duplicate cluster mapping ignored`, { cluster: key });
-        return;
+    const initPromises = [];
+    for (const group of this._config.groups) {
+      for (const mapping of group.downstreams) {
+        const normalizedKey = normalizeKey(mapping.key);
+        if (this._downstreams.has(normalizedKey)) {
+          logger.warn(`Duplicate downstream mapping ignored`, { key: normalizedKey });
+          continue;
+        }
+        const state = {
+          mapping,
+          group,
+          client: null,
+          transport: null,
+          process: null,
+          status: "Connecting",
+          lastHeartbeat: null,
+          consecutiveFailures: 0,
+          tools: [],
+          reconnecting: false
+        };
+        this._downstreams.set(normalizedKey, state);
+        initPromises.push(
+          (async () => {
+            try {
+              await this._connectDownstream(state);
+            } catch (error) {
+              const msg = error instanceof Error ? error.message : String(error);
+              logger.error(`Failed to initialize downstream`, {
+                key: normalizedKey,
+                group: group.namespace,
+                error: msg
+              });
+              state.status = "Failed";
+            }
+          })()
+        );
       }
-      const state = {
-        mapping,
-        client: null,
-        transport: null,
-        process: null,
-        status: "Connecting",
-        lastHeartbeat: null,
-        consecutiveFailures: 0,
-        tools: [],
-        reconnecting: false
-      };
-      this._downstreams.set(key, state);
-      try {
-        await this._connectDownstream(state);
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        logger.error(`Failed to initialize downstream for cluster`, {
-          cluster: key,
-          error: msg
-        });
-        state.status = "Failed";
-      }
-    });
+    }
     await Promise.allSettled(initPromises);
     const connected = [...this._downstreams.values()].filter(
       (d) => d.status === "Connected"
@@ -155,21 +160,26 @@ var DownstreamManager = class {
   }
   /**
    * Spawn a child @azure/mcp process and connect to it.
+   * Uses the group config for namespace, mode, and readOnly settings.
    */
   async _connectDownstream(state) {
-    const key = normalizeClusterUrl(state.mapping.clusterUrl);
-    logger.info(`Connecting to downstream MCP`, { cluster: key });
+    const normalizedKey = normalizeKey(state.mapping.key);
+    const { group } = state;
+    logger.info(`Connecting to downstream MCP`, {
+      key: normalizedKey,
+      namespace: group.namespace
+    });
     const args = [
       "-y",
       "@azure/mcp@latest",
       "server",
       "start",
       "--mode",
-      "all",
+      group.mode ?? "all",
       "--namespace",
-      "kusto"
+      group.namespace
     ];
-    if (this._config.readOnly) {
+    if (group.readOnly !== false) {
       args.push("--read-only");
     }
     const env = {
@@ -187,7 +197,7 @@ var DownstreamManager = class {
       if (clientId) {
         env["AZURE_CLIENT_ID"] = clientId;
         logger.debug("Setting AZURE_CLIENT_ID for downstream", {
-          cluster: key,
+          key: normalizedKey,
           clientId
         });
       }
@@ -199,7 +209,7 @@ var DownstreamManager = class {
     });
     const client = new Client(
       {
-        name: `mcp-router-downstream-${key}`,
+        name: `mcp-router-downstream-${normalizedKey}`,
         version: "1.0.0"
       },
       {
@@ -221,14 +231,15 @@ var DownstreamManager = class {
     state.consecutiveFailures = 0;
     state.tools = tools;
     logger.info(`Connected to downstream MCP`, {
-      cluster: key,
+      key: normalizedKey,
+      namespace: group.namespace,
       toolCount: tools.length,
       tools: tools.map((t) => t.name)
     });
     if (state.process) {
       state.process.on("exit", (code, signal) => {
         logger.warn(`Downstream process exited unexpectedly`, {
-          cluster: key,
+          key: normalizedKey,
           code,
           signal
         });
@@ -237,7 +248,7 @@ var DownstreamManager = class {
         state.transport = null;
         state.process = null;
         if (this._onDownstreamExit) {
-          this._onDownstreamExit(key);
+          this._onDownstreamExit(normalizedKey);
         }
       });
     }
@@ -245,15 +256,15 @@ var DownstreamManager = class {
   /**
    * Reconnect a failed/disconnected downstream.
    */
-  async reconnect(clusterUrl) {
-    const key = normalizeClusterUrl(clusterUrl);
-    const state = this._downstreams.get(key);
+  async reconnect(key) {
+    const normalizedKey = normalizeKey(key);
+    const state = this._downstreams.get(normalizedKey);
     if (!state) {
-      logger.error(`Cannot reconnect: unknown cluster`, { cluster: key });
+      logger.error(`Cannot reconnect: unknown downstream`, { key: normalizedKey });
       return false;
     }
     if (state.reconnecting) {
-      logger.debug(`Already reconnecting`, { cluster: key });
+      logger.debug(`Already reconnecting`, { key: normalizedKey });
       return false;
     }
     state.reconnecting = true;
@@ -263,7 +274,7 @@ var DownstreamManager = class {
       return true;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      logger.error(`Reconnection failed`, { cluster: key, error: msg });
+      logger.error(`Reconnection failed`, { key: normalizedKey, error: msg });
       state.status = "Failed";
       return false;
     } finally {
@@ -307,9 +318,9 @@ var DownstreamManager = class {
   /**
    * Ping a downstream for health checking.
    */
-  async ping(clusterUrl) {
-    const key = normalizeClusterUrl(clusterUrl);
-    const state = this._downstreams.get(key);
+  async ping(key) {
+    const normalizedKey = normalizeKey(key);
+    const state = this._downstreams.get(normalizedKey);
     if (!state || !state.client || state.status !== "Connected") {
       return false;
     }
@@ -333,7 +344,7 @@ var DownstreamManager = class {
       const msg = error instanceof Error ? error.message : String(error);
       state.consecutiveFailures++;
       logger.warn(`Ping failed`, {
-        cluster: key,
+        key: normalizedKey,
         consecutiveFailures: state.consecutiveFailures,
         error: msg
       });
@@ -346,17 +357,17 @@ var DownstreamManager = class {
     }
   }
   /**
-   * Call a tool on a specific downstream by cluster URL.
+   * Call a tool on a specific downstream by key.
    */
-  async callTool(clusterUrl, toolName, args) {
-    const key = normalizeClusterUrl(clusterUrl);
-    const state = this._downstreams.get(key);
+  async callTool(key, toolName, args) {
+    const normalizedKey = normalizeKey(key);
+    const state = this._downstreams.get(normalizedKey);
     if (!state) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Unknown cluster "${clusterUrl}". Available clusters: ${this.getClusterUrls().join(", ")}`
+            text: `Error: Unknown downstream "${key}". Available: ${this.getDownstreamKeys().join(", ")}`
           }
         ],
         isError: true
@@ -367,7 +378,7 @@ var DownstreamManager = class {
         content: [
           {
             type: "text",
-            text: `Error: Downstream for cluster "${clusterUrl}" is not connected (status: ${state.status}). Try again later.`
+            text: `Error: Downstream "${key}" is not connected (status: ${state.status}). Try again later.`
           }
         ],
         isError: true
@@ -386,7 +397,7 @@ var DownstreamManager = class {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes("401") || msg.includes("403") || msg.includes("Unauthorized") || msg.includes("Forbidden")) {
         logger.error(`Auth error from downstream`, {
-          cluster: key,
+          key: normalizedKey,
           identity: state.mapping.identity,
           tool: toolName,
           error: msg
@@ -396,7 +407,7 @@ var DownstreamManager = class {
         content: [
           {
             type: "text",
-            text: `Error calling tool "${toolName}" on cluster "${clusterUrl}": ${msg}`
+            text: `Error calling tool "${toolName}" on "${key}": ${msg}`
           }
         ],
         isError: true
@@ -422,8 +433,8 @@ var DownstreamManager = class {
       };
     }
     const results = await Promise.allSettled(
-      connectedDownstreams.map(async ([clusterUrl]) => {
-        return this.callTool(clusterUrl, toolName, args);
+      connectedDownstreams.map(async ([key]) => {
+        return this.callTool(key, toolName, args);
       })
     );
     const mergedContent = [];
@@ -445,17 +456,44 @@ var DownstreamManager = class {
     return { content: mergedContent, isError: hasError };
   }
   /**
-   * Get all configured cluster URLs.
+   * Get all configured downstream keys.
    */
-  getClusterUrls() {
+  getDownstreamKeys() {
     return [...this._downstreams.keys()];
+  }
+  /**
+   * Get the routing key property name. All groups must use the same routing key
+   * for the current single-router model; returns the first group's routing key.
+   */
+  getRoutingKey() {
+    if (this._config.groups.length > 0) {
+      return this._config.groups[0].routingKey;
+    }
+    return "cluster-uri";
+  }
+  /**
+   * Get the forwardKeyAs property name. When forwarding the routing key value
+   * to the downstream, use this name instead of the routing key.
+   *
+   * Returns the routing key if no override is configured.
+   */
+  getForwardKeyAs() {
+    if (this._config.groups.length > 0) {
+      const group = this._config.groups[0];
+      if (group.forwardKeyAs) {
+        return group.forwardKeyAs;
+      }
+      return group.routingKey;
+    }
+    return this.getRoutingKey();
   }
   /**
    * Get the connection info for all downstreams.
    */
   getConnections() {
-    return [...this._downstreams.entries()].map(([clusterUrl, state]) => ({
-      clusterUrl,
+    return [...this._downstreams.entries()].map(([key, state]) => ({
+      key,
+      group: state.group.namespace,
       identity: state.mapping.identity,
       status: state.status,
       lastHeartbeat: state.lastHeartbeat,
@@ -478,9 +516,9 @@ var DownstreamManager = class {
   /**
    * Get the status of a specific downstream.
    */
-  getStatus(clusterUrl) {
-    const key = normalizeClusterUrl(clusterUrl);
-    return this._downstreams.get(key)?.status ?? null;
+  getStatus(key) {
+    const normalizedKey = normalizeKey(key);
+    return this._downstreams.get(normalizedKey)?.status ?? null;
   }
   /**
    * Shut down all downstream connections gracefully.
@@ -489,14 +527,14 @@ var DownstreamManager = class {
     logger.info("Shutting down all downstream connections...");
     const shutdownPromises = [...this._downstreams.values()].map(
       async (state) => {
-        const key = normalizeClusterUrl(state.mapping.clusterUrl);
+        const normalizedKey = normalizeKey(state.mapping.key);
         try {
           await this._cleanupDownstream(state);
-          logger.debug(`Downstream shut down`, { cluster: key });
+          logger.debug(`Downstream shut down`, { key: normalizedKey });
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
           logger.error(`Error shutting down downstream`, {
-            cluster: key,
+            key: normalizedKey,
             error: msg
           });
         }
@@ -514,39 +552,51 @@ var ToolRouter = class {
   _mergedTools = [];
   _routableTools = /* @__PURE__ */ new Set();
   _fanOutTools = /* @__PURE__ */ new Set();
+  _routingKey;
+  _forwardKeyAs;
   constructor(downstreamManager) {
     this._downstreamManager = downstreamManager;
+    this._routingKey = downstreamManager.getRoutingKey();
+    this._forwardKeyAs = downstreamManager.getForwardKeyAs();
+    logger.info("ToolRouter initialized", {
+      routingKey: this._routingKey,
+      forwardKeyAs: this._forwardKeyAs,
+      areEqual: this._routingKey === this._forwardKeyAs
+    });
   }
   /**
    * Build the merged tool list from downstream tools.
-   * Dynamically classifies tools: if schema has a 'cluster' property → routable, otherwise → fan-out.
+   * Dynamically classifies tools: if schema has the routing key property → routable, otherwise → fan-out.
    */
   refreshTools() {
+    this._routingKey = this._downstreamManager.getRoutingKey();
+    this._forwardKeyAs = this._downstreamManager.getForwardKeyAs();
     const baseTools = this._downstreamManager.getToolDefinitions();
     if (baseTools.length === 0) {
       logger.warn("No tools discovered from any downstream \u2014 tool list will be empty");
       this._mergedTools = [];
       return;
     }
-    const clusterUrls = this._downstreamManager.getClusterUrls();
+    const downstreamKeys = this._downstreamManager.getDownstreamKeys();
     this._routableTools.clear();
     this._fanOutTools.clear();
     for (const tool of baseTools) {
-      if (tool.inputSchema.properties?.["cluster"]) {
+      if (tool.inputSchema.properties?.[this._routingKey]) {
         this._routableTools.add(tool.name);
       } else {
         this._fanOutTools.add(tool.name);
       }
     }
     logger.info("Tool classification", {
+      routingKey: this._routingKey,
       routable: [...this._routableTools],
       fanOut: [...this._fanOutTools]
     });
     this._mergedTools = baseTools.map((tool) => {
       if (this._routableTools.has(tool.name)) {
-        return this._enhanceRoutableTool(tool, clusterUrls);
+        return this._enhanceRoutableTool(tool, downstreamKeys);
       }
-      return this._enhanceFanOutTool(tool, clusterUrls);
+      return this._enhanceFanOutTool(tool, downstreamKeys);
     });
     logger.info(`Tool list refreshed`, {
       toolCount: this._mergedTools.length,
@@ -554,53 +604,53 @@ var ToolRouter = class {
     });
   }
   /**
-   * Enhance a cluster-routable tool:
-   * - Mark `cluster` as required
-   * - Add `enum` with available cluster URLs
+   * Enhance a routable tool:
+   * - Mark the routing key as required
+   * - Add `enum` with available downstream keys
    * - Update description to mention routing
    */
-  _enhanceRoutableTool(tool, clusterUrls) {
+  _enhanceRoutableTool(tool, downstreamKeys) {
     const schema = structuredClone(tool.inputSchema);
     if (!schema.properties) {
       schema.properties = {};
     }
-    const existingCluster = schema.properties["cluster"];
-    schema.properties["cluster"] = {
-      ...existingCluster ?? {},
+    const existingProp = schema.properties[this._routingKey];
+    schema.properties[this._routingKey] = {
+      ...existingProp ?? {},
       type: "string",
-      description: `The Kusto cluster URL to query. Must be one of the available clusters: ${clusterUrls.join(", ")}`,
-      enum: clusterUrls
+      description: `The ${this._routingKey} to route to. Must be one of: ${downstreamKeys.join(", ")}`,
+      enum: downstreamKeys
     };
     if (!schema.required) {
       schema.required = [];
     }
-    if (!schema.required.includes("cluster")) {
-      schema.required.push("cluster");
+    if (!schema.required.includes(this._routingKey)) {
+      schema.required.push(this._routingKey);
     }
     return {
       name: tool.name,
-      description: tool.description ? `${tool.description} (Routed to the specified cluster)` : `Kusto tool routed to the specified cluster`,
+      description: tool.description ? `${tool.description} (Routed to the specified ${this._routingKey})` : `Tool routed to the specified ${this._routingKey}`,
       inputSchema: schema
     };
   }
   /**
    * Enhance a fan-out tool:
-   * - Optionally add a `cluster` parameter to filter results
+   * - Optionally add the routing key parameter to filter results
    * - Update description to explain fan-out behavior
    */
-  _enhanceFanOutTool(tool, clusterUrls) {
+  _enhanceFanOutTool(tool, downstreamKeys) {
     const schema = structuredClone(tool.inputSchema);
     if (!schema.properties) {
       schema.properties = {};
     }
-    schema.properties["cluster"] = {
+    schema.properties[this._routingKey] = {
       type: "string",
-      description: `Optional: specify a Kusto cluster URL to query only that cluster. If omitted, queries all clusters. Available: ${clusterUrls.join(", ")}`,
-      enum: clusterUrls
+      description: `Optional: specify a ${this._routingKey} to target only that downstream. If omitted, queries all. Available: ${downstreamKeys.join(", ")}`,
+      enum: downstreamKeys
     };
     return {
       name: tool.name,
-      description: tool.description ? `${tool.description} (Queries all available clusters unless a specific cluster is specified)` : `Lists Kusto clusters across all available connections`,
+      description: tool.description ? `${tool.description} (Queries all available downstreams unless a specific ${this._routingKey} is specified)` : `Queries all available downstreams`,
       inputSchema: schema
     };
   }
@@ -617,14 +667,14 @@ var ToolRouter = class {
     const isRoutable = this._routableTools.has(toolName);
     const isFanOut = this._fanOutTools.has(toolName);
     if (isRoutable) {
-      return this._routeToCluster(toolName, args);
+      return this._routeToDownstream(toolName, args);
     }
     if (isFanOut) {
       return this._routeFanOut(toolName, args);
     }
     logger.warn(`Unknown tool called`, { tool: toolName });
-    if (args["cluster"]) {
-      return this._routeToCluster(toolName, args);
+    if (args[this._routingKey]) {
+      return this._routeToDownstream(toolName, args);
     }
     return {
       content: [
@@ -637,31 +687,31 @@ var ToolRouter = class {
     };
   }
   /**
-   * Route to a specific downstream based on the `cluster` argument.
+   * Route to a specific downstream based on the routing key argument.
    */
-  async _routeToCluster(toolName, args) {
-    const cluster = args["cluster"];
-    if (!cluster) {
-      const clusterUrls2 = this._downstreamManager.getClusterUrls();
+  async _routeToDownstream(toolName, args) {
+    const routingValue = args[this._routingKey];
+    if (!routingValue) {
+      const downstreamKeys2 = this._downstreamManager.getDownstreamKeys();
       return {
         content: [
           {
             type: "text",
-            text: `Error: The "cluster" parameter is required for tool "${toolName}". Available clusters: ${clusterUrls2.join(", ")}`
+            text: `Error: The "${this._routingKey}" parameter is required for tool "${toolName}". Available: ${downstreamKeys2.join(", ")}`
           }
         ],
         isError: true
       };
     }
-    const normalizedCluster = normalizeClusterUrl(cluster);
-    const clusterUrls = this._downstreamManager.getClusterUrls();
-    const matchedCluster = clusterUrls.find((url) => url === normalizedCluster);
-    if (!matchedCluster) {
+    const normalizedValue = normalizeKey(routingValue);
+    const downstreamKeys = this._downstreamManager.getDownstreamKeys();
+    const matched = downstreamKeys.find((k) => k === normalizedValue);
+    if (!matched) {
       return {
         content: [
           {
             type: "text",
-            text: `Error: Cluster "${cluster}" is not configured. Available clusters: ${clusterUrls.join(", ")}`
+            text: `Error: "${routingValue}" is not configured. Available: ${downstreamKeys.join(", ")}`
           }
         ],
         isError: true
@@ -669,38 +719,63 @@ var ToolRouter = class {
     }
     logger.debug(`Routing tool call`, {
       tool: toolName,
-      cluster: matchedCluster
+      [this._routingKey]: matched
     });
-    return this._downstreamManager.callTool(matchedCluster, toolName, args);
+    const forwardArgs = this._transformRoutingKey(args);
+    logger.info("Forwarding routable tool call to downstream", {
+      tool: toolName,
+      routingKey: this._routingKey,
+      forwardKeyAs: this._forwardKeyAs,
+      originalArgs: Object.keys(args),
+      forwardedArgs: Object.keys(forwardArgs),
+      forwardedArgsValues: forwardArgs
+    });
+    return this._downstreamManager.callTool(matched, toolName, forwardArgs);
   }
   /**
-   * Fan-out: call all downstreams (or a single one if cluster is specified).
+   * Fan-out: call all downstreams (or a single one if routing key is specified).
    */
   async _routeFanOut(toolName, args) {
-    const cluster = args["cluster"];
-    if (cluster) {
-      const normalizedCluster = normalizeClusterUrl(cluster);
-      const clusterUrls = this._downstreamManager.getClusterUrls();
-      const matchedCluster = clusterUrls.find((url) => url === normalizedCluster);
-      if (!matchedCluster) {
+    const routingValue = args[this._routingKey];
+    if (routingValue) {
+      const normalizedValue = normalizeKey(routingValue);
+      const downstreamKeys = this._downstreamManager.getDownstreamKeys();
+      const matched = downstreamKeys.find((k) => k === normalizedValue);
+      if (!matched) {
         return {
           content: [
             {
               type: "text",
-              text: `Error: Cluster "${cluster}" is not configured. Available clusters: ${clusterUrls.join(", ")}`
+              text: `Error: "${routingValue}" is not configured. Available: ${downstreamKeys.join(", ")}`
             }
           ],
           isError: true
         };
       }
       const forwardArgs2 = { ...args };
-      delete forwardArgs2["cluster"];
-      return this._downstreamManager.callTool(matchedCluster, toolName, forwardArgs2);
+      delete forwardArgs2[this._routingKey];
+      return this._downstreamManager.callTool(matched, toolName, forwardArgs2);
     }
     logger.debug(`Fan-out tool call to all downstreams`, { tool: toolName });
     const forwardArgs = { ...args };
-    delete forwardArgs["cluster"];
+    delete forwardArgs[this._routingKey];
     return this._downstreamManager.callToolOnAll(toolName, forwardArgs);
+  }
+  /**
+   * Transform the routing key in args for downstream forwarding.
+   * If forwardKeyAs differs from routingKey, rename the property.
+   * E.g., routing on "account" but forwarding as "accountName".
+   */
+  _transformRoutingKey(args) {
+    if (this._forwardKeyAs === this._routingKey) {
+      return args;
+    }
+    const transformed = { ...args };
+    if (this._routingKey in transformed) {
+      transformed[this._forwardKeyAs] = transformed[this._routingKey];
+      delete transformed[this._routingKey];
+    }
+    return transformed;
   }
 };
 
@@ -715,12 +790,12 @@ var HealthMonitor = class {
   constructor(downstreamManager, config) {
     this._downstreamManager = downstreamManager;
     this._config = config;
-    this._downstreamManager.onDownstreamExit((clusterUrl) => {
+    this._downstreamManager.onDownstreamExit((key) => {
       if (this._running) {
         logger.info("Downstream process exited, scheduling immediate reconnection", {
-          cluster: clusterUrl
+          key
         });
-        this._scheduleReconnect(clusterUrl);
+        this._scheduleReconnect(key);
       }
     });
   }
@@ -772,18 +847,18 @@ var HealthMonitor = class {
     const connections = this._downstreamManager.getConnections();
     for (const connection of connections) {
       if (connection.status === "Connected") {
-        const ok = await this._downstreamManager.ping(connection.clusterUrl);
+        const ok = await this._downstreamManager.ping(connection.key);
         if (!ok) {
           logger.warn("Health check failed, scheduling reconnection", {
-            cluster: connection.clusterUrl
+            key: connection.key
           });
-          this._scheduleReconnect(connection.clusterUrl);
+          this._scheduleReconnect(connection.key);
         } else {
-          this._reconnectBackoffs.delete(connection.clusterUrl);
+          this._reconnectBackoffs.delete(connection.key);
         }
       } else if (connection.status === "Failed" || connection.status === "Disconnected") {
-        if (!this._reconnectTimers.has(connection.clusterUrl)) {
-          this._scheduleReconnect(connection.clusterUrl);
+        if (!this._reconnectTimers.has(connection.key)) {
+          this._scheduleReconnect(connection.key);
         }
       }
     }
@@ -791,45 +866,45 @@ var HealthMonitor = class {
   /**
    * Schedule a reconnection attempt with exponential backoff.
    */
-  _scheduleReconnect(clusterUrl) {
-    if (this._reconnectTimers.has(clusterUrl)) {
+  _scheduleReconnect(key) {
+    if (this._reconnectTimers.has(key)) {
       return;
     }
-    const currentBackoff = this._reconnectBackoffs.get(clusterUrl) ?? 1;
+    const currentBackoff = this._reconnectBackoffs.get(key) ?? 1;
     const backoffMs = currentBackoff * 1e3;
     logger.info("Scheduling reconnection", {
-      cluster: clusterUrl,
+      key,
       backoffSeconds: currentBackoff
     });
     const timer = setTimeout(async () => {
-      this._reconnectTimers.delete(clusterUrl);
+      this._reconnectTimers.delete(key);
       if (!this._running) {
         return;
       }
-      logger.info("Attempting reconnection", { cluster: clusterUrl });
-      const success = await this._downstreamManager.reconnect(clusterUrl);
+      logger.info("Attempting reconnection", { key });
+      const success = await this._downstreamManager.reconnect(key);
       if (success) {
-        logger.info("Reconnection successful", { cluster: clusterUrl });
-        this._reconnectBackoffs.delete(clusterUrl);
+        logger.info("Reconnection successful", { key });
+        this._reconnectBackoffs.delete(key);
       } else {
         const nextBackoff = Math.min(
           currentBackoff * 2,
           this._config.maxReconnectBackoffSeconds
         );
-        this._reconnectBackoffs.set(clusterUrl, nextBackoff);
+        this._reconnectBackoffs.set(key, nextBackoff);
         logger.warn("Reconnection failed, will retry", {
-          cluster: clusterUrl,
+          key,
           nextBackoffSeconds: nextBackoff
         });
         if (this._running) {
-          this._scheduleReconnect(clusterUrl);
+          this._scheduleReconnect(key);
         }
       }
     }, backoffMs);
     if (timer.unref) {
       timer.unref();
     }
-    this._reconnectTimers.set(clusterUrl, timer);
+    this._reconnectTimers.set(key, timer);
   }
   /**
    * Whether the health monitor is currently running.
@@ -982,31 +1057,82 @@ function registerShutdownHandlers(components) {
 // src/index.ts
 function parseMapping(value, previous) {
   const eqIndex = value.indexOf("=");
-  let clusterUrl;
+  let key;
   let identity;
   if (eqIndex === -1) {
-    clusterUrl = value;
+    key = value;
     identity = "";
   } else {
-    clusterUrl = value.substring(0, eqIndex);
+    key = value.substring(0, eqIndex);
     identity = value.substring(eqIndex + 1);
   }
-  if (!clusterUrl) {
-    throw new Error(`Invalid mapping: "${value}". Expected format: clusterUrl=identity or clusterUrl`);
+  if (!key) {
+    throw new Error(`Invalid mapping: "${value}". Expected format: key=identity or key`);
   }
-  previous.push({ clusterUrl, identity });
+  previous.push({ key, identity });
   return previous;
+}
+function loadConfigFile(configPath) {
+  const raw = readFileSync(configPath, "utf-8");
+  const parsed = JSON.parse(raw);
+  if (!parsed.groups || !Array.isArray(parsed.groups) || parsed.groups.length === 0) {
+    throw new Error('Config file must contain a non-empty "groups" array.');
+  }
+  for (const group of parsed.groups) {
+    if (!group.namespace) {
+      throw new Error('Each group must have a "namespace" field.');
+    }
+    if (!group.routingKey) {
+      throw new Error(`Group "${group.namespace}" must have a "routingKey" field.`);
+    }
+    if (!group.downstreams || !Array.isArray(group.downstreams) || group.downstreams.length === 0) {
+      throw new Error(`Group "${group.namespace}" must have a non-empty "downstreams" array.`);
+    }
+    for (const ds of group.downstreams) {
+      if (!ds.key) {
+        throw new Error(`Each downstream in group "${group.namespace}" must have a "key" field.`);
+      }
+      if (ds.identity === void 0) {
+        ds.identity = "";
+      }
+    }
+  }
+  return {
+    groups: parsed.groups,
+    pingIntervalSeconds: parsed.pingIntervalSeconds ?? 60,
+    pingTimeoutSeconds: parsed.pingTimeoutSeconds ?? 10,
+    maxReconnectBackoffSeconds: parsed.maxReconnectBackoffSeconds ?? 300,
+    logLevel: parsed.logLevel ?? "info"
+  };
 }
 async function main() {
   const program = new Command();
   program.name("mcp-router").description(
-    "MCP server that routes tool calls to multiple downstream @azure/mcp instances"
-  ).version("1.0.0").requiredOption(
+    "Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances"
+  ).version("1.0.0").option(
+    "--config <path>",
+    "Path to a JSON config file defining downstream groups"
+  ).option(
+    "--namespace <namespace>",
+    '@azure/mcp namespace for CLI mode (e.g. "kusto", "cosmos")',
+    "kusto"
+  ).option(
+    "--routing-key <key>",
+    'Tool schema property name used for routing (e.g. "cluster-uri", "account")',
+    "cluster-uri"
+  ).option(
+    "--forward-key-as <key>",
+    "Rename the routing key when forwarding to the downstream. E.g., --routing-key account --forward-key-as accountName"
+  ).option(
     "--mapping <mapping>",
-    'Cluster-to-identity mapping in format "clusterUrl=identity". Can be specified multiple times for multiple clusters. If identity is omitted, uses the default managed identity.',
+    'Downstream mapping in format "key=identity" (CLI mode). Can be specified multiple times. If identity is omitted, uses the default managed identity.',
     parseMapping,
     []
-  ).option("--read-only", "Run downstream MCPs in read-only mode", true).option("--no-read-only", "Allow write operations on downstream MCPs").option(
+  ).option(
+    "--mode <mode>",
+    "@azure/mcp --mode value (CLI mode)",
+    "all"
+  ).option("--read-only", "Run downstream MCPs in read-only mode (CLI mode)", true).option("--no-read-only", "Allow write operations on downstream MCPs").option(
     "--ping-interval <seconds>",
     "Health check ping interval in seconds",
     "60"
@@ -1024,26 +1150,50 @@ async function main() {
     "info"
   ).parse(process.argv);
   const opts = program.opts();
-  const mappings = opts.mapping;
-  if (mappings.length === 0) {
-    logger.error(
-      "No cluster mappings provided. Use --mapping to specify at least one cluster."
-    );
-    process.exit(1);
+  let config;
+  if (opts.config) {
+    try {
+      config = loadConfigFile(opts.config);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logger.error(`Failed to load config file: ${msg}`);
+      process.exit(1);
+    }
+    if (opts.logLevel !== "info") {
+      config.logLevel = opts.logLevel;
+    }
+  } else {
+    const mappings = opts.mapping;
+    if (mappings.length === 0) {
+      logger.error(
+        "No downstream mappings provided. Use --mapping or --config."
+      );
+      process.exit(1);
+    }
+    const group = {
+      namespace: opts.namespace,
+      routingKey: opts.routingKey,
+      forwardKeyAs: opts.forwardKeyAs,
+      mode: opts.mode,
+      readOnly: opts.readOnly,
+      downstreams: mappings
+    };
+    config = {
+      groups: [group],
+      pingIntervalSeconds: parseInt(opts.pingInterval, 10),
+      pingTimeoutSeconds: parseInt(opts.pingTimeout, 10),
+      maxReconnectBackoffSeconds: parseInt(opts.maxReconnectBackoff, 10),
+      logLevel: opts.logLevel
+    };
   }
-  const config = {
-    mappings,
-    readOnly: opts.readOnly,
-    pingIntervalSeconds: parseInt(opts.pingInterval, 10),
-    pingTimeoutSeconds: parseInt(opts.pingTimeout, 10),
-    maxReconnectBackoffSeconds: parseInt(opts.maxReconnectBackoff, 10),
-    logLevel: opts.logLevel
-  };
   setLogLevel(config.logLevel);
   enableFileLogging();
   logger.info("Starting MCP Router", {
-    clusters: config.mappings.map((m) => m.clusterUrl),
-    readOnly: config.readOnly,
+    groups: config.groups.map((g) => ({
+      namespace: g.namespace,
+      routingKey: g.routingKey,
+      downstreams: g.downstreams.map((d) => d.key)
+    })),
     pingIntervalSeconds: config.pingIntervalSeconds
   });
   const downstreamManager = new DownstreamManager(config);
@@ -1074,7 +1224,7 @@ async function main() {
     transport
   });
   logger.info("MCP Router is ready", {
-    clusters: downstreamManager.getClusterUrls(),
+    downstreams: downstreamManager.getDownstreamKeys(),
     tools: tools.map((t) => t.name),
     connectedDownstreams: connectedCount
   });
@@ -1086,3 +1236,6 @@ main().catch((error) => {
   });
   process.exit(1);
 });
+export {
+  parseMapping
+};

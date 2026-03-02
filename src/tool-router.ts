@@ -1,15 +1,15 @@
 /**
  * ToolRouter — merges tool schemas from downstream MCPs and routes
- * tools/call requests to the correct downstream based on the routing key parameter.
+ * tools/call requests to the correct downstream based on a configurable routing key.
  *
  * Dynamically classifies tools at runtime:
- * - Tools whose schema contains a 'cluster' property → routable (route to one downstream)
- * - Tools without 'cluster' → fan-out (call all downstreams, merge results)
+ * - Tools whose schema contains the routing key property → routable (route to one downstream)
+ * - Tools without the routing key → fan-out (call all downstreams, merge results)
  */
 
 import type { DownstreamManager } from './downstream-manager.js';
 import type { ToolCallResult, ToolDefinition, ToolInputSchema, PropertySchema } from './types.js';
-import { normalizeClusterUrl } from './downstream-manager.js';
+import { normalizeKey } from './downstream-manager.js';
 import { logger } from './logger.js';
 
 export class ToolRouter {
@@ -17,16 +17,27 @@ export class ToolRouter {
     private _mergedTools: ToolDefinition[] = [];
     private _routableTools = new Set<string>();
     private _fanOutTools = new Set<string>();
+    private _routingKey: string;
+    private _forwardKeyAs: string;
 
     constructor(downstreamManager: DownstreamManager) {
         this._downstreamManager = downstreamManager;
+        this._routingKey = downstreamManager.getRoutingKey();
+        this._forwardKeyAs = downstreamManager.getForwardKeyAs();
+        logger.info('ToolRouter initialized', {
+            routingKey: this._routingKey,
+            forwardKeyAs: this._forwardKeyAs,
+            areEqual: this._routingKey === this._forwardKeyAs,
+        });
     }
 
     /**
      * Build the merged tool list from downstream tools.
-     * Dynamically classifies tools: if schema has a 'cluster' property → routable, otherwise → fan-out.
+     * Dynamically classifies tools: if schema has the routing key property → routable, otherwise → fan-out.
      */
     refreshTools(): void {
+        this._routingKey = this._downstreamManager.getRoutingKey();
+        this._forwardKeyAs = this._downstreamManager.getForwardKeyAs();
         const baseTools = this._downstreamManager.getToolDefinitions();
         if (baseTools.length === 0) {
             logger.warn('No tools discovered from any downstream — tool list will be empty');
@@ -34,13 +45,13 @@ export class ToolRouter {
             return;
         }
 
-        const clusterUrls = this._downstreamManager.getClusterUrls();
+        const downstreamKeys = this._downstreamManager.getDownstreamKeys();
 
         // Classify tools dynamically by inspecting their schemas
         this._routableTools.clear();
         this._fanOutTools.clear();
         for (const tool of baseTools) {
-            if (tool.inputSchema.properties?.['cluster']) {
+            if (tool.inputSchema.properties?.[this._routingKey]) {
                 this._routableTools.add(tool.name);
             } else {
                 this._fanOutTools.add(tool.name);
@@ -48,15 +59,16 @@ export class ToolRouter {
         }
 
         logger.info('Tool classification', {
+            routingKey: this._routingKey,
             routable: [...this._routableTools],
             fanOut: [...this._fanOutTools],
         });
 
         this._mergedTools = baseTools.map((tool) => {
             if (this._routableTools.has(tool.name)) {
-                return this._enhanceRoutableTool(tool, clusterUrls);
+                return this._enhanceRoutableTool(tool, downstreamKeys);
             }
-            return this._enhanceFanOutTool(tool, clusterUrls);
+            return this._enhanceFanOutTool(tool, downstreamKeys);
         });
 
         logger.info(`Tool list refreshed`, {
@@ -66,12 +78,12 @@ export class ToolRouter {
     }
 
     /**
-     * Enhance a cluster-routable tool:
-     * - Mark `cluster` as required
-     * - Add `enum` with available cluster URLs
+     * Enhance a routable tool:
+     * - Mark the routing key as required
+     * - Add `enum` with available downstream keys
      * - Update description to mention routing
      */
-    private _enhanceRoutableTool(tool: ToolDefinition, clusterUrls: string[]): ToolDefinition {
+    private _enhanceRoutableTool(tool: ToolDefinition, downstreamKeys: string[]): ToolDefinition {
         const schema = structuredClone(tool.inputSchema) as ToolInputSchema;
 
         // Ensure properties object exists
@@ -79,56 +91,56 @@ export class ToolRouter {
             schema.properties = {};
         }
 
-        // Enhance or create the cluster property
-        const existingCluster = schema.properties['cluster'] as PropertySchema | undefined;
-        schema.properties['cluster'] = {
-            ...(existingCluster ?? {}),
+        // Enhance or create the routing key property
+        const existingProp = schema.properties[this._routingKey] as PropertySchema | undefined;
+        schema.properties[this._routingKey] = {
+            ...(existingProp ?? {}),
             type: 'string',
-            description: `The Kusto cluster URL to query. Must be one of the available clusters: ${clusterUrls.join(', ')}`,
-            enum: clusterUrls,
+            description: `The ${this._routingKey} to route to. Must be one of: ${downstreamKeys.join(', ')}`,
+            enum: downstreamKeys,
         };
 
-        // Ensure cluster is required
+        // Ensure routing key is required
         if (!schema.required) {
             schema.required = [];
         }
-        if (!schema.required.includes('cluster')) {
-            schema.required.push('cluster');
+        if (!schema.required.includes(this._routingKey)) {
+            schema.required.push(this._routingKey);
         }
 
         return {
             name: tool.name,
             description: tool.description
-                ? `${tool.description} (Routed to the specified cluster)`
-                : `Kusto tool routed to the specified cluster`,
+                ? `${tool.description} (Routed to the specified ${this._routingKey})`
+                : `Tool routed to the specified ${this._routingKey}`,
             inputSchema: schema,
         };
     }
 
     /**
      * Enhance a fan-out tool:
-     * - Optionally add a `cluster` parameter to filter results
+     * - Optionally add the routing key parameter to filter results
      * - Update description to explain fan-out behavior
      */
-    private _enhanceFanOutTool(tool: ToolDefinition, clusterUrls: string[]): ToolDefinition {
+    private _enhanceFanOutTool(tool: ToolDefinition, downstreamKeys: string[]): ToolDefinition {
         const schema = structuredClone(tool.inputSchema) as ToolInputSchema;
 
         if (!schema.properties) {
             schema.properties = {};
         }
 
-        // Add optional cluster parameter — if provided, routes to one; otherwise fans out
-        schema.properties['cluster'] = {
+        // Add optional routing key parameter — if provided, routes to one; otherwise fans out
+        schema.properties[this._routingKey] = {
             type: 'string',
-            description: `Optional: specify a Kusto cluster URL to query only that cluster. If omitted, queries all clusters. Available: ${clusterUrls.join(', ')}`,
-            enum: clusterUrls,
+            description: `Optional: specify a ${this._routingKey} to target only that downstream. If omitted, queries all. Available: ${downstreamKeys.join(', ')}`,
+            enum: downstreamKeys,
         };
 
         return {
             name: tool.name,
             description: tool.description
-                ? `${tool.description} (Queries all available clusters unless a specific cluster is specified)`
-                : `Lists Kusto clusters across all available connections`,
+                ? `${tool.description} (Queries all available downstreams unless a specific ${this._routingKey} is specified)`
+                : `Queries all available downstreams`,
             inputSchema: schema,
         };
     }
@@ -151,17 +163,17 @@ export class ToolRouter {
         const isFanOut = this._fanOutTools.has(toolName);
 
         if (isRoutable) {
-            return this._routeToCluster(toolName, args);
+            return this._routeToDownstream(toolName, args);
         }
 
         if (isFanOut) {
             return this._routeFanOut(toolName, args);
         }
 
-        // Unknown tool — try to route if cluster is provided, otherwise error
+        // Unknown tool — try to route if routing key is provided, otherwise error
         logger.warn(`Unknown tool called`, { tool: toolName });
-        if (args['cluster']) {
-            return this._routeToCluster(toolName, args);
+        if (args[this._routingKey]) {
+            return this._routeToDownstream(toolName, args);
         }
 
         return {
@@ -176,39 +188,39 @@ export class ToolRouter {
     }
 
     /**
-     * Route to a specific downstream based on the `cluster` argument.
+     * Route to a specific downstream based on the routing key argument.
      */
-    private async _routeToCluster(
+    private async _routeToDownstream(
         toolName: string,
         args: Record<string, unknown>
     ): Promise<ToolCallResult> {
-        const cluster = args['cluster'] as string | undefined;
+        const routingValue = args[this._routingKey] as string | undefined;
 
-        if (!cluster) {
-            const clusterUrls = this._downstreamManager.getClusterUrls();
+        if (!routingValue) {
+            const downstreamKeys = this._downstreamManager.getDownstreamKeys();
             return {
                 content: [
                     {
                         type: 'text',
-                        text: `Error: The "cluster" parameter is required for tool "${toolName}". Available clusters: ${clusterUrls.join(', ')}`,
+                        text: `Error: The "${this._routingKey}" parameter is required for tool "${toolName}". Available: ${downstreamKeys.join(', ')}`,
                     },
                 ],
                 isError: true,
             };
         }
 
-        const normalizedCluster = normalizeClusterUrl(cluster);
+        const normalizedValue = normalizeKey(routingValue);
 
         // Find matching downstream
-        const clusterUrls = this._downstreamManager.getClusterUrls();
-        const matchedCluster = clusterUrls.find((url) => url === normalizedCluster);
+        const downstreamKeys = this._downstreamManager.getDownstreamKeys();
+        const matched = downstreamKeys.find((k) => k === normalizedValue);
 
-        if (!matchedCluster) {
+        if (!matched) {
             return {
                 content: [
                     {
                         type: 'text',
-                        text: `Error: Cluster "${cluster}" is not configured. Available clusters: ${clusterUrls.join(', ')}`,
+                        text: `Error: "${routingValue}" is not configured. Available: ${downstreamKeys.join(', ')}`,
                     },
                 ],
                 isError: true,
@@ -217,53 +229,81 @@ export class ToolRouter {
 
         logger.debug(`Routing tool call`, {
             tool: toolName,
-            cluster: matchedCluster,
+            [this._routingKey]: matched,
         });
 
-        return this._downstreamManager.callTool(matchedCluster, toolName, args);
+        // Transform the routing key for forwarding if forwardKeyAs differs
+        const forwardArgs = this._transformRoutingKey(args);
+        logger.info('Forwarding routable tool call to downstream', {
+            tool: toolName,
+            routingKey: this._routingKey,
+            forwardKeyAs: this._forwardKeyAs,
+            originalArgs: Object.keys(args),
+            forwardedArgs: Object.keys(forwardArgs),
+            forwardedArgsValues: forwardArgs,
+        });
+        return this._downstreamManager.callTool(matched, toolName, forwardArgs);
     }
 
     /**
-     * Fan-out: call all downstreams (or a single one if cluster is specified).
+     * Fan-out: call all downstreams (or a single one if routing key is specified).
      */
     private async _routeFanOut(
         toolName: string,
         args: Record<string, unknown>
     ): Promise<ToolCallResult> {
-        const cluster = args['cluster'] as string | undefined;
+        const routingValue = args[this._routingKey] as string | undefined;
 
-        if (cluster) {
-            // If cluster is specified, route to just that one
-            const normalizedCluster = normalizeClusterUrl(cluster);
-            const clusterUrls = this._downstreamManager.getClusterUrls();
-            const matchedCluster = clusterUrls.find((url) => url === normalizedCluster);
+        if (routingValue) {
+            // If routing key is specified, route to just that one
+            const normalizedValue = normalizeKey(routingValue);
+            const downstreamKeys = this._downstreamManager.getDownstreamKeys();
+            const matched = downstreamKeys.find((k) => k === normalizedValue);
 
-            if (!matchedCluster) {
+            if (!matched) {
                 return {
                     content: [
                         {
                             type: 'text',
-                            text: `Error: Cluster "${cluster}" is not configured. Available clusters: ${clusterUrls.join(', ')}`,
+                            text: `Error: "${routingValue}" is not configured. Available: ${downstreamKeys.join(', ')}`,
                         },
                     ],
                     isError: true,
                 };
             }
 
-            // Remove the synthetic cluster arg before forwarding — the real tool doesn't have it
+            // Remove the synthetic routing key arg before forwarding — the real tool doesn't have it
             const forwardArgs = { ...args };
-            delete forwardArgs['cluster'];
+            delete forwardArgs[this._routingKey];
 
-            return this._downstreamManager.callTool(matchedCluster, toolName, forwardArgs);
+            return this._downstreamManager.callTool(matched, toolName, forwardArgs);
         }
 
         // Fan out to all
         logger.debug(`Fan-out tool call to all downstreams`, { tool: toolName });
 
-        // Remove the synthetic cluster arg
+        // Remove the synthetic routing key arg
         const forwardArgs = { ...args };
-        delete forwardArgs['cluster'];
+        delete forwardArgs[this._routingKey];
 
         return this._downstreamManager.callToolOnAll(toolName, forwardArgs);
+    }
+
+    /**
+     * Transform the routing key in args for downstream forwarding.
+     * If forwardKeyAs differs from routingKey, rename the property.
+     * E.g., routing on "account" but forwarding as "accountName".
+     */
+    private _transformRoutingKey(args: Record<string, unknown>): Record<string, unknown> {
+        if (this._forwardKeyAs === this._routingKey) {
+            return args;
+        }
+
+        const transformed = { ...args };
+        if (this._routingKey in transformed) {
+            transformed[this._forwardKeyAs] = transformed[this._routingKey];
+            delete transformed[this._routingKey];
+        }
+        return transformed;
     }
 }

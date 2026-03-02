@@ -1,8 +1,8 @@
 /**
  * DownstreamManager — spawns and manages child @azure/mcp processes.
  *
- * For each mapping, it:
- * 1. Spawns `npx -y @azure/mcp@latest server start --namespace <ns> --read-only`
+ * For each downstream mapping in each group, it:
+ * 1. Spawns `npx -y @azure/mcp@latest server start --namespace <ns>`
  * 2. Connects an MCP Client via StdioClientTransport
  * 3. Discovers tools via tools/list
  * 4. Maintains connection state and supports reconnection
@@ -12,7 +12,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
-    ClusterMapping,
+    DownstreamMapping,
+    DownstreamGroupConfig,
     ConnectionStatus,
     DownstreamConnection,
     RouterConfig,
@@ -25,7 +26,8 @@ import { logger } from './logger.js';
  * Internal state for a downstream connection, including the MCP client and child process.
  */
 interface DownstreamState {
-    mapping: ClusterMapping;
+    mapping: DownstreamMapping;
+    group: DownstreamGroupConfig;
     client: Client | null;
     transport: StdioClientTransport | null;
     process: ChildProcess | null;
@@ -37,16 +39,11 @@ interface DownstreamState {
 }
 
 /**
- * Normalizes a cluster URL for consistent matching.
- * Lowercases, removes trailing slash, ensures https:// prefix.
+ * Normalizes a downstream key for consistent matching.
+ * Lowercases and trims whitespace. The key is treated as an opaque identifier.
  */
-export function normalizeClusterUrl(url: string): string {
-    let normalized = url.trim().toLowerCase();
-    if (!normalized.startsWith('https://') && !normalized.startsWith('http://')) {
-        normalized = `https://${normalized}`;
-    }
-    normalized = normalized.replace(/\/+$/, '');
-    return normalized;
+export function normalizeKey(key: string): string {
+    return key.trim().toLowerCase();
 }
 
 /**
@@ -62,7 +59,7 @@ function extractClientIdFromIdentity(identity: string): string | null {
 export class DownstreamManager {
     private readonly _downstreams = new Map<string, DownstreamState>();
     private readonly _config: RouterConfig;
-    private _onDownstreamExit: ((clusterUrl: string) => void) | null = null;
+    private _onDownstreamExit: ((key: string) => void) | null = null;
 
     constructor(config: RouterConfig) {
         this._config = config;
@@ -72,46 +69,56 @@ export class DownstreamManager {
      * Register a callback invoked immediately when a downstream child process exits unexpectedly.
      * Used by HealthMonitor to trigger immediate reconnection instead of waiting for the next ping.
      */
-    onDownstreamExit(callback: (clusterUrl: string) => void): void {
+    onDownstreamExit(callback: (key: string) => void): void {
         this._onDownstreamExit = callback;
     }
 
     /**
-     * Initialize all downstream connections.
+     * Initialize all downstream connections across all groups.
      * Spawns child processes and discovers tools from each.
      */
     async initializeAll(): Promise<void> {
-        const initPromises = this._config.mappings.map(async (mapping) => {
-            const key = normalizeClusterUrl(mapping.clusterUrl);
-            if (this._downstreams.has(key)) {
-                logger.warn(`Duplicate cluster mapping ignored`, { cluster: key });
-                return;
-            }
+        const initPromises: Promise<void>[] = [];
 
-            const state: DownstreamState = {
-                mapping,
-                client: null,
-                transport: null,
-                process: null,
-                status: 'Connecting',
-                lastHeartbeat: null,
-                consecutiveFailures: 0,
-                tools: [],
-                reconnecting: false,
-            };
-            this._downstreams.set(key, state);
+        for (const group of this._config.groups) {
+            for (const mapping of group.downstreams) {
+                const normalizedKey = normalizeKey(mapping.key);
+                if (this._downstreams.has(normalizedKey)) {
+                    logger.warn(`Duplicate downstream mapping ignored`, { key: normalizedKey });
+                    continue;
+                }
 
-            try {
-                await this._connectDownstream(state);
-            } catch (error) {
-                const msg = error instanceof Error ? error.message : String(error);
-                logger.error(`Failed to initialize downstream for cluster`, {
-                    cluster: key,
-                    error: msg,
-                });
-                state.status = 'Failed';
+                const state: DownstreamState = {
+                    mapping,
+                    group,
+                    client: null,
+                    transport: null,
+                    process: null,
+                    status: 'Connecting',
+                    lastHeartbeat: null,
+                    consecutiveFailures: 0,
+                    tools: [],
+                    reconnecting: false,
+                };
+                this._downstreams.set(normalizedKey, state);
+
+                initPromises.push(
+                    (async () => {
+                        try {
+                            await this._connectDownstream(state);
+                        } catch (error) {
+                            const msg = error instanceof Error ? error.message : String(error);
+                            logger.error(`Failed to initialize downstream`, {
+                                key: normalizedKey,
+                                group: group.namespace,
+                                error: msg,
+                            });
+                            state.status = 'Failed';
+                        }
+                    })()
+                );
             }
-        });
+        }
 
         await Promise.allSettled(initPromises);
 
@@ -127,10 +134,15 @@ export class DownstreamManager {
 
     /**
      * Spawn a child @azure/mcp process and connect to it.
+     * Uses the group config for namespace, mode, and readOnly settings.
      */
     private async _connectDownstream(state: DownstreamState): Promise<void> {
-        const key = normalizeClusterUrl(state.mapping.clusterUrl);
-        logger.info(`Connecting to downstream MCP`, { cluster: key });
+        const normalizedKey = normalizeKey(state.mapping.key);
+        const { group } = state;
+        logger.info(`Connecting to downstream MCP`, {
+            key: normalizedKey,
+            namespace: group.namespace,
+        });
 
         const args = [
             '-y',
@@ -138,12 +150,12 @@ export class DownstreamManager {
             'server',
             'start',
             '--mode',
-            'all',
+            group.mode ?? 'all',
             '--namespace',
-            'kusto',
+            group.namespace,
         ];
 
-        if (this._config.readOnly) {
+        if (group.readOnly !== false) {
             args.push('--read-only');
         }
 
@@ -165,14 +177,14 @@ export class DownstreamManager {
             env['IDENTITY_HEADER'] = process.env['IDENTITY_HEADER'];
         }
 
-        // If a specific identity (UAMI resource ID or client ID) is configured for this cluster,
+        // If a specific identity (UAMI resource ID or client ID) is configured,
         // set AZURE_CLIENT_ID so the downstream uses that identity instead of the default.
         if (state.mapping.identity) {
             const clientId = extractClientIdFromIdentity(state.mapping.identity);
             if (clientId) {
                 env['AZURE_CLIENT_ID'] = clientId;
                 logger.debug('Setting AZURE_CLIENT_ID for downstream', {
-                    cluster: key,
+                    key: normalizedKey,
                     clientId,
                 });
             }
@@ -186,7 +198,7 @@ export class DownstreamManager {
 
         const client = new Client(
             {
-                name: `mcp-router-downstream-${key}`,
+                name: `mcp-router-downstream-${normalizedKey}`,
                 version: '1.0.0',
             },
             {
@@ -213,7 +225,8 @@ export class DownstreamManager {
         state.tools = tools;
 
         logger.info(`Connected to downstream MCP`, {
-            cluster: key,
+            key: normalizedKey,
+            namespace: group.namespace,
             toolCount: tools.length,
             tools: tools.map((t) => t.name),
         });
@@ -222,7 +235,7 @@ export class DownstreamManager {
         if (state.process) {
             state.process.on('exit', (code, signal) => {
                 logger.warn(`Downstream process exited unexpectedly`, {
-                    cluster: key,
+                    key: normalizedKey,
                     code,
                     signal,
                 });
@@ -233,7 +246,7 @@ export class DownstreamManager {
 
                 // Notify the health monitor for immediate reconnection
                 if (this._onDownstreamExit) {
-                    this._onDownstreamExit(key);
+                    this._onDownstreamExit(normalizedKey);
                 }
             });
         }
@@ -242,16 +255,16 @@ export class DownstreamManager {
     /**
      * Reconnect a failed/disconnected downstream.
      */
-    async reconnect(clusterUrl: string): Promise<boolean> {
-        const key = normalizeClusterUrl(clusterUrl);
-        const state = this._downstreams.get(key);
+    async reconnect(key: string): Promise<boolean> {
+        const normalizedKey = normalizeKey(key);
+        const state = this._downstreams.get(normalizedKey);
         if (!state) {
-            logger.error(`Cannot reconnect: unknown cluster`, { cluster: key });
+            logger.error(`Cannot reconnect: unknown downstream`, { key: normalizedKey });
             return false;
         }
 
         if (state.reconnecting) {
-            logger.debug(`Already reconnecting`, { cluster: key });
+            logger.debug(`Already reconnecting`, { key: normalizedKey });
             return false;
         }
 
@@ -265,7 +278,7 @@ export class DownstreamManager {
             return true;
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
-            logger.error(`Reconnection failed`, { cluster: key, error: msg });
+            logger.error(`Reconnection failed`, { key: normalizedKey, error: msg });
             state.status = 'Failed';
             return false;
         } finally {
@@ -317,9 +330,9 @@ export class DownstreamManager {
     /**
      * Ping a downstream for health checking.
      */
-    async ping(clusterUrl: string): Promise<boolean> {
-        const key = normalizeClusterUrl(clusterUrl);
-        const state = this._downstreams.get(key);
+    async ping(key: string): Promise<boolean> {
+        const normalizedKey = normalizeKey(key);
+        const state = this._downstreams.get(normalizedKey);
         if (!state || !state.client || state.status !== 'Connected') {
             return false;
         }
@@ -346,7 +359,7 @@ export class DownstreamManager {
             const msg = error instanceof Error ? error.message : String(error);
             state.consecutiveFailures++;
             logger.warn(`Ping failed`, {
-                cluster: key,
+                key: normalizedKey,
                 consecutiveFailures: state.consecutiveFailures,
                 error: msg,
             });
@@ -361,22 +374,22 @@ export class DownstreamManager {
     }
 
     /**
-     * Call a tool on a specific downstream by cluster URL.
+     * Call a tool on a specific downstream by key.
      */
     async callTool(
-        clusterUrl: string,
+        key: string,
         toolName: string,
         args: Record<string, unknown>
     ): Promise<ToolCallResult> {
-        const key = normalizeClusterUrl(clusterUrl);
-        const state = this._downstreams.get(key);
+        const normalizedKey = normalizeKey(key);
+        const state = this._downstreams.get(normalizedKey);
 
         if (!state) {
             return {
                 content: [
                     {
                         type: 'text',
-                        text: `Error: Unknown cluster "${clusterUrl}". Available clusters: ${this.getClusterUrls().join(', ')}`,
+                        text: `Error: Unknown downstream "${key}". Available: ${this.getDownstreamKeys().join(', ')}`,
                     },
                 ],
                 isError: true,
@@ -388,7 +401,7 @@ export class DownstreamManager {
                 content: [
                     {
                         type: 'text',
-                        text: `Error: Downstream for cluster "${clusterUrl}" is not connected (status: ${state.status}). Try again later.`,
+                        text: `Error: Downstream "${key}" is not connected (status: ${state.status}). Try again later.`,
                     },
                 ],
                 isError: true,
@@ -411,7 +424,7 @@ export class DownstreamManager {
             // Check for auth errors
             if (msg.includes('401') || msg.includes('403') || msg.includes('Unauthorized') || msg.includes('Forbidden')) {
                 logger.error(`Auth error from downstream`, {
-                    cluster: key,
+                    key: normalizedKey,
                     identity: state.mapping.identity,
                     tool: toolName,
                     error: msg,
@@ -422,7 +435,7 @@ export class DownstreamManager {
                 content: [
                     {
                         type: 'text',
-                        text: `Error calling tool "${toolName}" on cluster "${clusterUrl}": ${msg}`,
+                        text: `Error calling tool "${toolName}" on "${key}": ${msg}`,
                     },
                 ],
                 isError: true,
@@ -454,8 +467,8 @@ export class DownstreamManager {
         }
 
         const results = await Promise.allSettled(
-            connectedDownstreams.map(async ([clusterUrl]) => {
-                return this.callTool(clusterUrl, toolName, args);
+            connectedDownstreams.map(async ([key]) => {
+                return this.callTool(key, toolName, args);
             })
         );
 
@@ -481,18 +494,50 @@ export class DownstreamManager {
     }
 
     /**
-     * Get all configured cluster URLs.
+     * Get all configured downstream keys.
      */
-    getClusterUrls(): string[] {
+    getDownstreamKeys(): string[] {
         return [...this._downstreams.keys()];
+    }
+
+    /**
+     * Get the routing key property name. All groups must use the same routing key
+     * for the current single-router model; returns the first group's routing key.
+     */
+    getRoutingKey(): string {
+        if (this._config.groups.length > 0) {
+            return this._config.groups[0]!.routingKey;
+        }
+        return 'cluster-uri'; // fallback default — matches @azure/mcp kusto tool schema
+    }
+
+    /**
+     * Get the forwardKeyAs property name. When forwarding the routing key value
+     * to the downstream, use this name instead of the routing key.
+     *
+     * Returns the routing key if no override is configured.
+     */
+    getForwardKeyAs(): string {
+        if (this._config.groups.length > 0) {
+            const group = this._config.groups[0]!;
+
+            // Explicit config takes priority
+            if (group.forwardKeyAs) {
+                return group.forwardKeyAs;
+            }
+
+            return group.routingKey;
+        }
+        return this.getRoutingKey();
     }
 
     /**
      * Get the connection info for all downstreams.
      */
     getConnections(): DownstreamConnection[] {
-        return [...this._downstreams.entries()].map(([clusterUrl, state]) => ({
-            clusterUrl,
+        return [...this._downstreams.entries()].map(([key, state]) => ({
+            key,
+            group: state.group.namespace,
             identity: state.mapping.identity,
             status: state.status,
             lastHeartbeat: state.lastHeartbeat,
@@ -517,9 +562,9 @@ export class DownstreamManager {
     /**
      * Get the status of a specific downstream.
      */
-    getStatus(clusterUrl: string): ConnectionStatus | null {
-        const key = normalizeClusterUrl(clusterUrl);
-        return this._downstreams.get(key)?.status ?? null;
+    getStatus(key: string): ConnectionStatus | null {
+        const normalizedKey = normalizeKey(key);
+        return this._downstreams.get(normalizedKey)?.status ?? null;
     }
 
     /**
@@ -530,14 +575,14 @@ export class DownstreamManager {
 
         const shutdownPromises = [...this._downstreams.values()].map(
             async (state) => {
-                const key = normalizeClusterUrl(state.mapping.clusterUrl);
+                const normalizedKey = normalizeKey(state.mapping.key);
                 try {
                     await this._cleanupDownstream(state);
-                    logger.debug(`Downstream shut down`, { cluster: key });
+                    logger.debug(`Downstream shut down`, { key: normalizedKey });
                 } catch (error) {
                     const msg = error instanceof Error ? error.message : String(error);
                     logger.error(`Error shutting down downstream`, {
-                        cluster: key,
+                        key: normalizedKey,
                         error: msg,
                     });
                 }

@@ -26,12 +26,12 @@ export class HealthMonitor {
         this._config = config;
 
         // Register for immediate notification when a downstream process exits
-        this._downstreamManager.onDownstreamExit((clusterUrl) => {
+        this._downstreamManager.onDownstreamExit((key) => {
             if (this._running) {
                 logger.info('Downstream process exited, scheduling immediate reconnection', {
-                    cluster: clusterUrl,
+                    key,
                 });
-                this._scheduleReconnect(clusterUrl);
+                this._scheduleReconnect(key);
             }
         });
     }
@@ -98,24 +98,24 @@ export class HealthMonitor {
         for (const connection of connections) {
             if (connection.status === 'Connected') {
                 // Ping connected downstreams
-                const ok = await this._downstreamManager.ping(connection.clusterUrl);
+                const ok = await this._downstreamManager.ping(connection.key);
 
                 if (!ok) {
                     logger.warn('Health check failed, scheduling reconnection', {
-                        cluster: connection.clusterUrl,
+                        key: connection.key,
                     });
-                    this._scheduleReconnect(connection.clusterUrl);
+                    this._scheduleReconnect(connection.key);
                 } else {
                     // Reset backoff on successful ping
-                    this._reconnectBackoffs.delete(connection.clusterUrl);
+                    this._reconnectBackoffs.delete(connection.key);
                 }
             } else if (
                 connection.status === 'Failed' ||
                 connection.status === 'Disconnected'
             ) {
                 // Already unhealthy — schedule reconnection if not already scheduled
-                if (!this._reconnectTimers.has(connection.clusterUrl)) {
-                    this._scheduleReconnect(connection.clusterUrl);
+                if (!this._reconnectTimers.has(connection.key)) {
+                    this._scheduleReconnect(connection.key);
                 }
             }
         }
@@ -124,47 +124,47 @@ export class HealthMonitor {
     /**
      * Schedule a reconnection attempt with exponential backoff.
      */
-    private _scheduleReconnect(clusterUrl: string): void {
-        if (this._reconnectTimers.has(clusterUrl)) {
+    private _scheduleReconnect(key: string): void {
+        if (this._reconnectTimers.has(key)) {
             return; // Already scheduled
         }
 
-        const currentBackoff = this._reconnectBackoffs.get(clusterUrl) ?? 1;
+        const currentBackoff = this._reconnectBackoffs.get(key) ?? 1;
         const backoffMs = currentBackoff * 1000;
 
         logger.info('Scheduling reconnection', {
-            cluster: clusterUrl,
+            key,
             backoffSeconds: currentBackoff,
         });
 
         const timer = setTimeout(async () => {
-            this._reconnectTimers.delete(clusterUrl);
+            this._reconnectTimers.delete(key);
 
             if (!this._running) {
                 return;
             }
 
-            logger.info('Attempting reconnection', { cluster: clusterUrl });
-            const success = await this._downstreamManager.reconnect(clusterUrl);
+            logger.info('Attempting reconnection', { key });
+            const success = await this._downstreamManager.reconnect(key);
 
             if (success) {
-                logger.info('Reconnection successful', { cluster: clusterUrl });
-                this._reconnectBackoffs.delete(clusterUrl);
+                logger.info('Reconnection successful', { key });
+                this._reconnectBackoffs.delete(key);
             } else {
                 // Increase backoff with exponential growth, capped at max
                 const nextBackoff = Math.min(
                     currentBackoff * 2,
                     this._config.maxReconnectBackoffSeconds
                 );
-                this._reconnectBackoffs.set(clusterUrl, nextBackoff);
+                this._reconnectBackoffs.set(key, nextBackoff);
                 logger.warn('Reconnection failed, will retry', {
-                    cluster: clusterUrl,
+                    key,
                     nextBackoffSeconds: nextBackoff,
                 });
 
                 // Schedule next attempt
                 if (this._running) {
-                    this._scheduleReconnect(clusterUrl);
+                    this._scheduleReconnect(key);
                 }
             }
         }, backoffMs);
@@ -174,7 +174,7 @@ export class HealthMonitor {
             timer.unref();
         }
 
-        this._reconnectTimers.set(clusterUrl, timer);
+        this._reconnectTimers.set(key, timer);
     }
 
     /**
