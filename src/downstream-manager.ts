@@ -179,26 +179,26 @@ export class DownstreamManager {
 
         // If a specific identity (UAMI resource ID or client ID) is configured,
         // set AZURE_CLIENT_ID so the downstream uses that identity instead of the default.
-        if (state.mapping.identity) {
-            const clientId = extractClientIdFromIdentity(state.mapping.identity);
-            if (clientId) {
-                env['AZURE_CLIENT_ID'] = clientId;
-                logger.debug('Setting AZURE_CLIENT_ID for downstream', {
-                    key: normalizedKey,
-                    clientId,
-                });
-            }
-        }
+        // if (state.mapping.identity) {
+        //     const clientId = extractClientIdFromIdentity(state.mapping.identity);
+        //     if (clientId) {
+        //         env['AZURE_CLIENT_ID'] = clientId;
+        //         logger.debug('Setting AZURE_CLIENT_ID for downstream', {
+        //             key: normalizedKey,
+        //             clientId,
+        //         });
+        //     }
+        // }
 
-        logger.info('Spawning downstream MCP process', {
+        logger.info('Spawning downstream MCP process222', {
             key: normalizedKey,
             command: 'npx',
             args,
             env: {
                 AZURE_TOKEN_CREDENTIALS: env['AZURE_TOKEN_CREDENTIALS'] ?? '(not set)',
                 AZURE_CLIENT_ID: env['AZURE_CLIENT_ID'] ?? '(not set)',
-                IDENTITY_ENDPOINT: env['IDENTITY_ENDPOINT'] ? '(set)' : '(not set)',
-                IDENTITY_HEADER: env['IDENTITY_HEADER'] ? '(set)' : '(not set)',
+                IDENTITY_ENDPOINT: env['IDENTITY_ENDPOINT'] ??  '(not set)',
+                IDENTITY_HEADER: env['IDENTITY_HEADER'] ??  '(not set)',
             },
         });
 
