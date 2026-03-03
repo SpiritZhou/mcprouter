@@ -3,39 +3,28 @@
  */
 
 /**
- * Configuration for a group of downstream MCP servers sharing the same namespace.
- * Each group defines how to spawn child processes and which property to use for routing.
+ * A single routing entry parsed from one --router flag.
+ * Defines which tools to route, which parameter to use, the value for this target,
+ * and any environment overrides for the spawned child process.
+ *
+ * Parsed from the format:
+ *   toolPattern.injectParam="injectValue"; ENV_KEY="envValue"; ...
+ *
+ * Example:
+ *   kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"
  */
-export interface DownstreamGroupConfig {
-    /** @azure/mcp namespace (e.g. "kusto", "cosmos") */
-    namespace: string;
-    /** The tool schema property name used for routing (e.g. "cluster", "account") */
-    routingKey: string;
+export interface RouterEntry {
+    /** Glob pattern matching tool names, e.g. "kusto_*" or "cosmos_*" */
+    toolPattern: string;
+    /** Parameter name injected/matched for routing, e.g. "cluster_uri" */
+    injectParam: string;
+    /** The value associated with this routing target, e.g. "https://mycluster.kusto.windows.net" */
+    injectValue: string;
     /**
-     * When forwarding the routing key value to the downstream, use this property name instead.
-     * Useful when the downstream expects a different parameter name than the one exposed in the schema.
-     * E.g., routing on "account" but forwarding as "accountName".
-     * Defaults to the same as routingKey if not specified.
+     * Per-entry environment variable overrides applied to this downstream's child process.
+     * Layered on top of globalEnv. Typically used for per-identity vars like AZURE_CLIENT_ID.
      */
-    forwardKeyAs?: string;
-    /** @azure/mcp --mode value (default: "all") */
-    mode?: string;
-    /** Whether downstream MCPs in this group should run in read-only mode */
-    readOnly?: boolean;
-    /** Downstream instances in this group */
-    downstreams: DownstreamMapping[];
-}
-
-/**
- * A mapping from a routing key value to an identity resource ID.
- * The key is an opaque identifier (URL, name, region:account, etc.) that matches
- * the routing key property value in tool calls.
- */
-export interface DownstreamMapping {
-    /** Opaque routing key value, e.g. "https://mycluster.kusto.windows.net", "eastus:myaccount" */
-    key: string;
-    /** UAMI resource ID, client ID, or empty string if using default identity */
-    identity: string;
+    envOverrides: Record<string, string>;
 }
 
 /**
@@ -44,15 +33,13 @@ export interface DownstreamMapping {
 export type ConnectionStatus = 'Connected' | 'Connecting' | 'Failed' | 'Disconnected';
 
 /**
- * Represents a downstream @azure/mcp server instance.
+ * Represents a downstream @azure/mcp server instance (public view).
  */
 export interface DownstreamConnection {
-    /** Normalized downstream key (opaque routing value) */
+    /** Hash-based key uniquely identifying this downstream */
     key: string;
-    /** Group namespace this downstream belongs to */
-    group: string;
-    /** Identity resource ID */
-    identity: string;
+    /** Human-readable spec: "injectParam=injectValue" */
+    entrySpec: string;
     /** Current connection status */
     status: ConnectionStatus;
     /** ISO 8601 timestamp of last successful heartbeat */
@@ -113,18 +100,29 @@ export interface ToolContent {
     [key: string]: unknown;
 }
 
+
+
 /**
- * CLI configuration parsed from command-line arguments or config file.
+ * CLI configuration parsed from command-line arguments.
  */
 export interface RouterConfig {
-    /** Downstream groups — each group defines a namespace, routing key, and downstream instances */
-    groups: DownstreamGroupConfig[];
-    /** Health check ping interval in seconds */
-    pingIntervalSeconds: number;
-    /** Health check ping timeout in seconds */
-    pingTimeoutSeconds: number;
-    /** Max reconnection backoff in seconds */
-    maxReconnectBackoffSeconds: number;
+    /** Parsed --router entries, one per routing target */
+    entries: RouterEntry[];
+    /**
+     * Arguments forwarded verbatim to each child @azure/mcp process.
+     * E.g. ["server", "start", "--namespace", "kusto", "--mode", "all", "--read-only"]
+     */
+    passthroughArgs: string[];
+    /**
+     * Environment variables from --env KEY=VALUE, applied to ALL child processes.
+     * Applied before per-entry envOverrides.
+     */
+    globalEnv: Record<string, string>;
+    /**
+     * Version specifier for the @azure/mcp npm package used when spawning child processes.
+     * E.g. "latest", "1.2.3". Defaults to "latest".
+     */
+    mcpVersion: string;
     /** Log level */
     logLevel: 'debug' | 'info' | 'warn' | 'error';
 }

@@ -1,71 +1,151 @@
 /**
- * Tests for CLI argument parsing.
+ * Tests for router-parser utilities: parseRouterSpec, computeDownstreamKey, matchesPattern.
  */
 
 import { describe, it, expect } from 'vitest';
-import type { DownstreamMapping } from '../types.js';
+import { parseRouterSpec, computeDownstreamKey, matchesPattern } from '../router-parser.js';
 
-/**
- * Parse a --mapping value (extracted from index.ts for testability).
- */
-function parseMapping(value: string): DownstreamMapping {
-    const eqIndex = value.indexOf('=');
-    let key: string;
-    let identity: string;
-
-    if (eqIndex === -1) {
-        key = value;
-        identity = '';
-    } else {
-        key = value.substring(0, eqIndex);
-        identity = value.substring(eqIndex + 1);
-    }
-
-    if (!key) {
-        throw new Error(
-            `Invalid mapping: "${value}". Expected format: key=identity or key`
+describe('parseRouterSpec', () => {
+    it('parses a spec with tool pattern, inject param, inject value, and env vars', () => {
+        const entry = parseRouterSpec(
+            'kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"'
         );
-    }
+        expect(entry.toolPattern).toBe('kusto_*');
+        expect(entry.injectParam).toBe('cluster_uri');
+        expect(entry.injectValue).toBe('https://mycluster.kusto.windows.net');
+        expect(entry.envOverrides).toEqual({ AZURE_CLIENT_ID: 'abc123' });
+    });
 
-    return { key, identity };
-}
-
-describe('CLI parseMapping', () => {
-    it('parses key=identity mapping', () => {
-        const result = parseMapping(
-            'https://cluster1.kusto.windows.net=/subscriptions/sub1/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id1'
+    it('parses a spec with no env vars', () => {
+        const entry = parseRouterSpec(
+            'kusto_*.cluster_uri="https://mycluster.kusto.windows.net"'
         );
-        expect(result.key).toBe('https://cluster1.kusto.windows.net');
-        expect(result.identity).toBe(
-            '/subscriptions/sub1/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id1'
+        expect(entry.toolPattern).toBe('kusto_*');
+        expect(entry.injectParam).toBe('cluster_uri');
+        expect(entry.injectValue).toBe('https://mycluster.kusto.windows.net');
+        expect(entry.envOverrides).toEqual({});
+    });
+
+    it('parses a spec with multiple env vars', () => {
+        const entry = parseRouterSpec(
+            'cosmos_*.account="myaccount"; AZURE_CLIENT_ID="cid"; AZURE_TENANT_ID="tid"'
+        );
+        expect(entry.toolPattern).toBe('cosmos_*');
+        expect(entry.injectParam).toBe('account');
+        expect(entry.injectValue).toBe('myaccount');
+        expect(entry.envOverrides).toEqual({ AZURE_CLIENT_ID: 'cid', AZURE_TENANT_ID: 'tid' });
+    });
+
+    it('parses exact tool name (no wildcard)', () => {
+        const entry = parseRouterSpec('my_tool.endpoint="https://api.example.com"');
+        expect(entry.toolPattern).toBe('my_tool');
+        expect(entry.injectParam).toBe('endpoint');
+        expect(entry.injectValue).toBe('https://api.example.com');
+    });
+
+    it('parses wildcard matching all tools', () => {
+        const entry = parseRouterSpec('*.param="value"');
+        expect(entry.toolPattern).toBe('*');
+        expect(entry.injectParam).toBe('param');
+        expect(entry.injectValue).toBe('value');
+    });
+
+    it('parses empty inject value', () => {
+        const entry = parseRouterSpec('kusto_*.cluster_uri=""');
+        expect(entry.injectValue).toBe('');
+    });
+
+    it('throws on missing first segment', () => {
+        expect(() => parseRouterSpec('')).toThrow();
+    });
+
+    it('throws on malformed first segment (no dot)', () => {
+        expect(() => parseRouterSpec('kusto_cluster_uri="value"')).toThrow();
+    });
+
+    it('throws on malformed env segment', () => {
+        expect(() =>
+            parseRouterSpec('kusto_*.cluster_uri="val"; BADVAR')
+        ).toThrow();
+    });
+});
+
+describe('computeDownstreamKey', () => {
+    const entry1 = {
+        toolPattern: 'kusto_*',
+        injectParam: 'cluster_uri',
+        injectValue: 'https://cluster1.kusto.windows.net',
+        envOverrides: { AZURE_CLIENT_ID: 'abc123' },
+    };
+
+    const entry2 = {
+        toolPattern: 'kusto_*',
+        injectParam: 'cluster_uri',
+        injectValue: 'https://cluster2.kusto.windows.net',
+        envOverrides: { AZURE_CLIENT_ID: 'xyz456' },
+    };
+
+    const passthroughArgs = ['server', 'start', '--namespace', 'kusto'];
+
+    it('returns a 16-char hex string', () => {
+        const key = computeDownstreamKey(passthroughArgs, entry1);
+        expect(key).toMatch(/^[0-9a-f]{16}$/);
+    });
+
+    it('same inputs produce same key (stability)', () => {
+        expect(computeDownstreamKey(passthroughArgs, entry1)).toBe(
+            computeDownstreamKey(passthroughArgs, entry1)
         );
     });
 
-    it('parses key-only mapping (no identity)', () => {
-        const result = parseMapping('https://cluster1.kusto.windows.net');
-        expect(result.key).toBe('https://cluster1.kusto.windows.net');
-        expect(result.identity).toBe('');
-    });
-
-    it('handles identity with multiple = signs (resource IDs)', () => {
-        const result = parseMapping(
-            'https://cluster.kusto.windows.net=/sub/rg/id=with=equals'
+    it('different injectValues produce different keys', () => {
+        expect(computeDownstreamKey(passthroughArgs, entry1)).not.toBe(
+            computeDownstreamKey(passthroughArgs, entry2)
         );
-        expect(result.key).toBe('https://cluster.kusto.windows.net');
-        expect(result.identity).toBe('/sub/rg/id=with=equals');
     });
 
-    it('parses non-URL key formats', () => {
-        const result = parseMapping('eastus:myaccount=some-identity');
-        expect(result.key).toBe('eastus:myaccount');
-        expect(result.identity).toBe('some-identity');
+    it('different passthroughArgs produce different keys', () => {
+        const otherArgs = ['server', 'start', '--namespace', 'cosmos'];
+        expect(computeDownstreamKey(passthroughArgs, entry1)).not.toBe(
+            computeDownstreamKey(otherArgs, entry1)
+        );
     });
 
-    it('throws on empty key', () => {
-        expect(() => parseMapping('=/some/identity')).toThrow('Invalid mapping');
+    it('different envOverrides with same injectValue produce same key (envOverrides not in hash)', () => {
+        const e1 = { ...entry1, envOverrides: { AZURE_CLIENT_ID: 'abc' } };
+        const e2 = { ...entry1, envOverrides: { AZURE_CLIENT_ID: 'xyz' } };
+        expect(computeDownstreamKey(passthroughArgs, e1)).toBe(
+            computeDownstreamKey(passthroughArgs, e2)
+        );
+    });
+});
+
+describe('matchesPattern', () => {
+    it('matches exact tool name', () => {
+        expect(matchesPattern('kusto_query', 'kusto_query')).toBe(true);
     });
 
-    it('throws on empty string', () => {
-        expect(() => parseMapping('')).toThrow('Invalid mapping');
+    it('does not match different exact name', () => {
+        expect(matchesPattern('kusto_query', 'kusto_table_list')).toBe(false);
+    });
+
+    it('matches prefix wildcard: kusto_*', () => {
+        expect(matchesPattern('kusto_*', 'kusto_query')).toBe(true);
+        expect(matchesPattern('kusto_*', 'kusto_table_list')).toBe(true);
+        expect(matchesPattern('kusto_*', 'cosmos_query')).toBe(false);
+    });
+
+    it('matches all-wildcard: *', () => {
+        expect(matchesPattern('*', 'kusto_query')).toBe(true);
+        expect(matchesPattern('*', 'anything')).toBe(true);
+    });
+
+    it('handles regex-special chars in tool names safely', () => {
+        // The pattern should not break on dots in the actual name
+        expect(matchesPattern('kusto_*', 'kusto_cluster.get')).toBe(true);
+    });
+
+    it('does not partially match', () => {
+        expect(matchesPattern('kusto_query', 'kusto_query_extra')).toBe(false);
     });
 });

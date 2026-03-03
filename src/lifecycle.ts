@@ -3,21 +3,18 @@
  * and stdin close events.
  *
  * Ensures:
- * 1. Health monitor is stopped
- * 2. MCP server transport is closed
- * 3. All downstream child processes are terminated (SIGTERM, then SIGKILL after 5s)
- * 4. Process exits cleanly
+ * 1. MCP server transport is closed
+ * 2. All downstream child processes are terminated (SIGTERM, then SIGKILL after 5s)
+ * 3. Process exits cleanly
  */
 
 import type { DownstreamManager } from './downstream-manager.js';
-import type { HealthMonitor } from './health-monitor.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { logger } from './logger.js';
 
 interface LifecycleComponents {
     downstreamManager: DownstreamManager;
-    healthMonitor: HealthMonitor;
     server: McpServer;
     transport: StdioServerTransport;
 }
@@ -37,17 +34,14 @@ export function registerShutdownHandlers(components: LifecycleComponents): void 
         logger.info(`Received ${signal}, shutting down gracefully...`);
 
         try {
-            // 1. Stop health monitor
-            components.healthMonitor.stop();
-
-            // 2. Close MCP server transport
+            // 1. Close MCP server transport
             try {
                 await components.transport.close();
             } catch {
                 // Ignore — transport may already be closed
             }
 
-            // 3. Shut down all downstream connections
+            // 2. Shut down all downstream connections
             await components.downstreamManager.shutdownAll();
 
             logger.info('Graceful shutdown complete');

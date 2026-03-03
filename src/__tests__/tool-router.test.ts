@@ -1,397 +1,251 @@
 /**
- * Tests for ToolRouter — schema merging and call routing logic.
+ * Tests for ToolRouter — tool proxying and call routing logic (new --router API).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ToolRouter } from '../tool-router.js';
 import type { DownstreamManager } from '../downstream-manager.js';
-import type { ToolDefinition, ToolCallResult } from '../types.js';
+import type { RouterEntry, ToolDefinition, ToolCallResult } from '../types.js';
 
-/**
- * Create a mock DownstreamManager with configurable downstream keys, tools, and routing key.
- */
-function createMockDownstreamManager(
-    downstreamKeys: string[],
-    tools: ToolDefinition[],
-    routingKey = 'cluster',
-    forwardKeyAs?: string
-): DownstreamManager {
+const CLUSTER1 = 'https://cluster1.kusto.windows.net';
+const CLUSTER2 = 'https://cluster2.kusto.windows.net';
+
+const KUSTO_ENTRIES: RouterEntry[] = [
+    {
+        toolPattern: 'kusto_*',
+        injectParam: 'cluster_uri',
+        injectValue: CLUSTER1,
+        envOverrides: { AZURE_CLIENT_ID: 'client1' },
+    },
+    {
+        toolPattern: 'kusto_*',
+        injectParam: 'cluster_uri',
+        injectValue: CLUSTER2,
+        envOverrides: { AZURE_CLIENT_ID: 'client2' },
+    },
+];
+
+const SAMPLE_TOOLS: ToolDefinition[] = [
+    {
+        name: 'kusto_query',
+        description: 'Execute a KQL query',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                cluster_uri: { type: 'string', description: 'Cluster URI' },
+                database: { type: 'string', description: 'Database name' },
+                query: { type: 'string', description: 'KQL query' },
+            },
+            required: ['cluster_uri', 'database', 'query'],
+        },
+    },
+    {
+        name: 'kusto_database_list',
+        description: 'List databases',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                cluster_uri: { type: 'string', description: 'Cluster URI' },
+            },
+            required: ['cluster_uri'],
+        },
+    },
+    {
+        name: 'kusto_cluster_list',
+        description: 'List clusters (no cluster_uri — fan-out candidate)',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                subscriptionId: { type: 'string', description: 'Subscription ID' },
+            },
+            required: ['subscriptionId'],
+        },
+    },
+    {
+        name: 'unrelated_tool',
+        description: 'A tool with no matching pattern',
+        inputSchema: {
+            type: 'object',
+            properties: { foo: { type: 'string' } },
+        },
+    },
+];
+
+function createMockDownstreamManager(): DownstreamManager {
     return {
-        getDownstreamKeys: vi.fn(() => downstreamKeys),
-        getToolDefinitions: vi.fn(() => tools),
-        getRoutingKey: vi.fn(() => routingKey),
-        getForwardKeyAs: vi.fn(() => forwardKeyAs ?? routingKey),
-        callTool: vi.fn(async (_key: string, _tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
+        getEntries: vi.fn(() => KUSTO_ENTRIES),
+        callTool: vi.fn(async (_entry: RouterEntry, _tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
             content: [{ type: 'text', text: 'mock result' }],
             isError: false,
         })),
-        callToolOnAll: vi.fn(async (_tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
+        callToolOnAll: vi.fn(async (_entries: RouterEntry[], _tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
             content: [{ type: 'text', text: 'merged result' }],
+            isError: false,
+        })),
+        callDefault: vi.fn(async (_tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
+            content: [{ type: 'text', text: 'default result' }],
             isError: false,
         })),
     } as unknown as DownstreamManager;
 }
 
-/** Sample tools with a 'cluster' routing key (like Kusto @azure/mcp) */
-const SAMPLE_ROUTABLE_TOOLS: ToolDefinition[] = [
-    {
-        name: 'kusto_query',
-        description: 'Execute a KQL query against an Azure Data Explorer cluster',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster identifier' },
-                database: { type: 'string', description: 'Database name' },
-                query: { type: 'string', description: 'KQL query' },
-            },
-            required: ['cluster', 'database', 'query'],
-        },
-    },
-    {
-        name: 'kusto_database_list',
-        description: 'List databases in a cluster',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster identifier' },
-            },
-            required: ['cluster'],
-        },
-    },
-    {
-        name: 'kusto_table_list',
-        description: 'List tables in a database',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster identifier' },
-                database: { type: 'string', description: 'Database name' },
-            },
-            required: ['cluster', 'database'],
-        },
-    },
-    {
-        name: 'kusto_table_schema',
-        description: 'Get schema for a table',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster identifier' },
-                database: { type: 'string', description: 'Database name' },
-                table: { type: 'string', description: 'Table name' },
-            },
-            required: ['cluster', 'database', 'table'],
-        },
-    },
-    {
-        name: 'kusto_sample',
-        description: 'Get sample data from a table',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster identifier' },
-                database: { type: 'string', description: 'Database name' },
-                table: { type: 'string', description: 'Table name' },
-                size: { type: 'number', description: 'Sample size' },
-            },
-            required: ['cluster', 'database', 'table'],
-        },
-    },
-    {
-        name: 'kusto_cluster_get',
-        description: 'Get info about a cluster',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                cluster: { type: 'string', description: 'Cluster name' },
-            },
-            required: ['cluster'],
-        },
-    },
-    {
-        name: 'kusto_cluster_list',
-        description: 'List available clusters',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                subscriptionId: { type: 'string', description: 'Azure subscription ID' },
-            },
-            required: ['subscriptionId'],
-        },
-    },
-];
-
-const DOWNSTREAM_KEYS = [
-    'https://cluster1.kusto.windows.net',
-    'https://cluster2.kusto.windows.net',
-];
-
 describe('ToolRouter', () => {
-    let mockDownstream: DownstreamManager;
+    let mockManager: DownstreamManager;
     let router: ToolRouter;
 
     beforeEach(() => {
-        mockDownstream = createMockDownstreamManager(DOWNSTREAM_KEYS, SAMPLE_ROUTABLE_TOOLS);
-        router = new ToolRouter(mockDownstream);
-        router.refreshTools();
+        mockManager = createMockDownstreamManager();
+        router = new ToolRouter(mockManager, KUSTO_ENTRIES);
+        router.refreshTools(SAMPLE_TOOLS);
     });
 
     describe('refreshTools', () => {
-        it('produces 7 merged tools', () => {
-            expect(router.getTools()).toHaveLength(7);
+        it('stores all tools unchanged (4 tools)', () => {
+            expect(router.getTools()).toHaveLength(4);
         });
 
-        it('makes routing key required with enum for routable tools', () => {
+        it('does not modify tool schemas', () => {
             const query = router.getTools().find((t) => t.name === 'kusto_query');
             expect(query).toBeDefined();
-            expect(query!.inputSchema.required).toContain('cluster');
-            expect(query!.inputSchema.properties!['cluster']!.enum).toEqual(DOWNSTREAM_KEYS);
-        });
-
-        it('adds optional routing key to fan-out tools', () => {
-            const list = router.getTools().find((t) => t.name === 'kusto_cluster_list');
-            expect(list).toBeDefined();
-            // Should have routing key property but NOT required
-            expect(list!.inputSchema.properties!['cluster']).toBeDefined();
-            expect(list!.inputSchema.properties!['cluster']!.enum).toEqual(DOWNSTREAM_KEYS);
-            // routing key should NOT be in required for fan-out tools
-            expect(list!.inputSchema.required).not.toContain('cluster');
+            // No enum injected — schema is identical to SAMPLE_TOOLS
+            expect(query!.inputSchema.properties!['cluster_uri']!.enum).toBeUndefined();
+            expect(query!.description).toBe('Execute a KQL query');
         });
 
         it('handles empty tool list gracefully', () => {
-            const emptyMock = createMockDownstreamManager(DOWNSTREAM_KEYS, []);
-            const emptyRouter = new ToolRouter(emptyMock);
-            emptyRouter.refreshTools();
+            const emptyRouter = new ToolRouter(mockManager, KUSTO_ENTRIES);
+            emptyRouter.refreshTools([]);
             expect(emptyRouter.getTools()).toHaveLength(0);
         });
     });
 
     describe('routeCall — routable tools', () => {
-        it('routes kusto_query to the correct downstream', async () => {
+        it('routes kusto_query using cluster_uri to matching entry', async () => {
             const result = await router.routeCall('kusto_query', {
-                cluster: 'https://cluster1.kusto.windows.net',
+                cluster_uri: CLUSTER1,
                 database: 'mydb',
                 query: 'T | take 10',
             });
 
             expect(result.isError).toBeFalsy();
-            expect(mockDownstream.callTool).toHaveBeenCalledWith(
-                'https://cluster1.kusto.windows.net',
-                'kusto_query',
-                {
-                    cluster: 'https://cluster1.kusto.windows.net',
-                    database: 'mydb',
-                    query: 'T | take 10',
-                }
-            );
+            const calledEntry = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![0] as RouterEntry;
+            expect(calledEntry.injectValue).toBe(CLUSTER1);
+            expect((mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![1]).toBe('kusto_query');
         });
 
-        it('returns error when routing key is missing', async () => {
-            const result = await router.routeCall('kusto_query', {
+        it('routes to second cluster', async () => {
+            await router.routeCall('kusto_query', {
+                cluster_uri: CLUSTER2,
                 database: 'mydb',
                 query: 'T | take 10',
             });
 
-            expect(result.isError).toBe(true);
-            expect(result.content[0]!.text).toContain('"cluster" parameter is required');
+            const calledEntry = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![0] as RouterEntry;
+            expect(calledEntry.injectValue).toBe(CLUSTER2);
         });
 
-        it('returns error when routing key value is unknown', async () => {
+        it('normalizes inject value case-insensitively', async () => {
             const result = await router.routeCall('kusto_query', {
-                cluster: 'https://unknown.kusto.windows.net',
+                cluster_uri: CLUSTER1.toUpperCase(),
                 database: 'mydb',
                 query: 'T | take 10',
             });
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0]!.text).toContain('not configured');
-        });
-
-        it('normalizes routing key value for matching', async () => {
-            const result = await router.routeCall('kusto_query', {
-                cluster: 'HTTPS://CLUSTER1.KUSTO.WINDOWS.NET',
-                database: 'mydb',
-                query: 'T | take 10',
-            });
-
             expect(result.isError).toBeFalsy();
-            expect(mockDownstream.callTool).toHaveBeenCalledWith(
-                'https://cluster1.kusto.windows.net',
+        });
+
+        it('returns error when inject value is unknown', async () => {
+            const result = await router.routeCall('kusto_query', {
+                cluster_uri: 'https://unknown.kusto.windows.net',
+                database: 'mydb',
+                query: 'T | take 10',
+            });
+            expect(result.isError).toBe(true);
+            expect(result.content[0]!.text).toContain('not a configured');
+        });
+
+        it('fans out when inject param is missing', async () => {
+            await router.routeCall('kusto_query', {
+                database: 'mydb',
+                query: 'T | take 10',
+            });
+            expect(mockManager.callToolOnAll).toHaveBeenCalledWith(
+                KUSTO_ENTRIES,
                 'kusto_query',
-                expect.any(Object)
+                { database: 'mydb', query: 'T | take 10' }
             );
+        });
+
+        it('ensures inject param is preserved in forwarded args', async () => {
+            await router.routeCall('kusto_query', {
+                cluster_uri: CLUSTER1,
+                database: 'mydb',
+                query: 'T | take 10',
+            });
+            const forwardedArgs = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![2] as Record<string, unknown>;
+            expect(forwardedArgs['cluster_uri']).toBe(CLUSTER1);
         });
     });
 
-    describe('routeCall — fan-out tools', () => {
-        it('fans out kusto_cluster_list to all downstreams when no routing key specified', async () => {
-            const result = await router.routeCall('kusto_cluster_list', {
-                subscriptionId: 'sub1',
-            });
+    describe('routeCall — tools with no matching pattern', () => {
+        it('routes unrelated_tool to the default downstream (no inject)', async () => {
+            await router.routeCall('unrelated_tool', { foo: 'bar' });
+            expect(mockManager.callDefault).toHaveBeenCalledWith('unrelated_tool', { foo: 'bar' });
+            expect(mockManager.callTool).not.toHaveBeenCalled();
+            expect(mockManager.callToolOnAll).not.toHaveBeenCalled();
+        });
+    });
 
-            expect(result.isError).toBeFalsy();
-            expect(mockDownstream.callToolOnAll).toHaveBeenCalledWith(
+    describe('routeCall — kusto_cluster_list (kusto_* matches but no cluster_uri in schema)', () => {
+        it('fans out when cluster_uri not provided', async () => {
+            await router.routeCall('kusto_cluster_list', { subscriptionId: 'sub1' });
+            expect(mockManager.callToolOnAll).toHaveBeenCalledWith(
+                KUSTO_ENTRIES,
                 'kusto_cluster_list',
                 { subscriptionId: 'sub1' }
             );
         });
 
-        it('routes kusto_cluster_list to specific downstream when routing key specified', async () => {
-            const result = await router.routeCall('kusto_cluster_list', {
+        it('routes to specific cluster when cluster_uri provided', async () => {
+            await router.routeCall('kusto_cluster_list', {
                 subscriptionId: 'sub1',
-                cluster: 'https://cluster1.kusto.windows.net',
+                cluster_uri: CLUSTER1,
             });
-
-            expect(result.isError).toBeFalsy();
-            expect(mockDownstream.callTool).toHaveBeenCalledWith(
-                'https://cluster1.kusto.windows.net',
-                'kusto_cluster_list',
-                { subscriptionId: 'sub1' } // routing key stripped
-            );
+            const calledEntry = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![0] as RouterEntry;
+            expect(calledEntry.injectValue).toBe(CLUSTER1);
         });
     });
 
-    describe('routeCall — unknown tools', () => {
-        it('returns error for unknown tool without routing key', async () => {
-            const result = await router.routeCall('unknown_tool', {});
-
-            expect(result.isError).toBe(true);
-            expect(result.content[0]!.text).toContain('Unknown tool');
-        });
-
-        it('routes unknown tool if routing key is provided', async () => {
-            const result = await router.routeCall('unknown_tool', {
-                cluster: 'https://cluster1.kusto.windows.net',
-            });
-
-            expect(result.isError).toBeFalsy();
-            expect(mockDownstream.callTool).toHaveBeenCalled();
-        });
-    });
-
-    describe('custom routing key', () => {
-        it('uses a custom routing key for classification and routing', async () => {
-            const tools: ToolDefinition[] = [
-                {
-                    name: 'cosmos_query',
-                    description: 'Query a Cosmos DB',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {
-                            account: { type: 'string', description: 'Account name' },
-                            query: { type: 'string', description: 'SQL query' },
-                        },
-                        required: ['account', 'query'],
-                    },
+    describe('mixed namespaces', () => {
+        it('routes cosmos_* tools to cosmos entries independently', async () => {
+            const cosmosEntry: RouterEntry = {
+                toolPattern: 'cosmos_*',
+                injectParam: 'account',
+                injectValue: 'myaccount',
+                envOverrides: {},
+            };
+            const cosmosTool: ToolDefinition = {
+                name: 'cosmos_query',
+                description: 'Query Cosmos',
+                inputSchema: {
+                    type: 'object',
+                    properties: { account: { type: 'string' }, query: { type: 'string' } },
+                    required: ['account', 'query'],
                 },
-                {
-                    name: 'cosmos_list_databases',
-                    description: 'List databases',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {},
-                    },
-                },
-            ];
-            const keys = ['eastus:myaccount', 'westus:otheraccount'];
-            const mock = createMockDownstreamManager(keys, tools, 'account');
-            const customRouter = new ToolRouter(mock);
-            customRouter.refreshTools();
+            };
+            const mixedRouter = new ToolRouter(mockManager, [...KUSTO_ENTRIES, cosmosEntry]);
+            mixedRouter.refreshTools([...SAMPLE_TOOLS, cosmosTool]);
 
-            const mergedTools = customRouter.getTools();
+            // cosmos_query routed via 'account' to cosmosEntry
+            await mixedRouter.routeCall('cosmos_query', { account: 'myaccount', query: 'SELECT 1' });
+            const calledEntry = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![0] as RouterEntry;
+            expect(calledEntry.injectParam).toBe('account');
+            expect(calledEntry.injectValue).toBe('myaccount');
 
-            // cosmos_query has 'account' → routable
-            const queryTool = mergedTools.find((t) => t.name === 'cosmos_query');
-            expect(queryTool!.inputSchema.properties!['account']!.enum).toEqual(keys);
-            expect(queryTool!.inputSchema.required).toContain('account');
-
-            // cosmos_list_databases has no 'account' → fan-out, gets optional 'account'
-            const listTool = mergedTools.find((t) => t.name === 'cosmos_list_databases');
-            expect(listTool!.inputSchema.properties!['account']).toBeDefined();
-            expect(listTool!.inputSchema.properties!['account']!.enum).toEqual(keys);
-
-            // Route a call using the custom routing key
-            const result = await customRouter.routeCall('cosmos_query', {
-                account: 'eastus:myaccount',
-                query: 'SELECT * FROM c',
-            });
-            expect(result.isError).toBeFalsy();
-            expect(mock.callTool).toHaveBeenCalledWith(
-                'eastus:myaccount',
-                'cosmos_query',
-                { account: 'eastus:myaccount', query: 'SELECT * FROM c' }
-            );
-        });
-    });
-
-    describe('forwardKeyAs', () => {
-        it('renames the routing key when forwarding to downstream', async () => {
-            // Route on "account" but forward as "accountName" to downstream
-            const tools: ToolDefinition[] = [
-                {
-                    name: 'cosmos_query',
-                    description: 'Query an account',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {
-                            account: { type: 'string', description: 'Account' },
-                            query: { type: 'string', description: 'SQL query' },
-                        },
-                        required: ['account', 'query'],
-                    },
-                },
-            ];
-            const keys = ['eastus:myaccount'];
-            const mock = createMockDownstreamManager(keys, tools, 'account', 'accountName');
-            const fwdRouter = new ToolRouter(mock);
-            fwdRouter.refreshTools();
-
-            const result = await fwdRouter.routeCall('cosmos_query', {
-                account: 'eastus:myaccount',
-                query: 'SELECT * FROM c',
-            });
-
-            expect(result.isError).toBeFalsy();
-            // The "account" key should be renamed to "accountName" in the forwarded args
-            expect(mock.callTool).toHaveBeenCalledWith(
-                'eastus:myaccount',
-                'cosmos_query',
-                { accountName: 'eastus:myaccount', query: 'SELECT * FROM c' }
-            );
-        });
-
-        it('strips routing key and renames in fan-out with specific target', async () => {
-            const tools: ToolDefinition[] = [
-                {
-                    name: 'cosmos_account_list',
-                    description: 'List accounts',
-                    inputSchema: {
-                        type: 'object',
-                        properties: {
-                            subscriptionId: { type: 'string', description: 'Sub ID' },
-                        },
-                        required: ['subscriptionId'],
-                    },
-                },
-            ];
-            const keys = ['eastus:myaccount'];
-            const mock = createMockDownstreamManager(keys, tools, 'account', 'accountName');
-            const fwdRouter = new ToolRouter(mock);
-            fwdRouter.refreshTools();
-
-            // Fan-out tool with account specified — should strip account (synthetic) from forwarded args
-            const result = await fwdRouter.routeCall('cosmos_account_list', {
-                subscriptionId: 'sub1',
-                account: 'eastus:myaccount',
-            });
-
-            expect(result.isError).toBeFalsy();
-            // Fan-out with specific target: routing key is stripped (it's synthetic), NOT renamed
-            expect(mock.callTool).toHaveBeenCalledWith(
-                'eastus:myaccount',
-                'cosmos_account_list',
-                { subscriptionId: 'sub1' }
-            );
+            // kusto_query should still route via cluster_uri, not account
+            vi.clearAllMocks();
+            await mixedRouter.routeCall('kusto_query', { cluster_uri: CLUSTER1, database: 'd', query: 'q' });
+            const kustoCalledEntry = (mockManager.callTool as ReturnType<typeof vi.fn>).mock.calls[0]![0] as RouterEntry;
+            expect(kustoCalledEntry.injectParam).toBe('cluster_uri');
         });
     });
 });

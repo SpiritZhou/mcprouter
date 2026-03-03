@@ -4,94 +4,64 @@
  * @sreagent/mcp-router
  *
  * Generic MCP server that routes tool calls to multiple downstream @azure/mcp
- * instances. Each downstream is spawned as a child process running
- * `npx -y @azure/mcp@latest server start --namespace <ns>`.
+ * instances. All child process arguments are forwarded verbatim via --args
+ * (one token per flag), making any future @azure/mcp CLI changes transparent.
  *
- * Supports two modes:
- * 1. CLI flags (single group):
- *    mcp-router --namespace kusto --routing-key cluster \
- *      --mapping https://cluster1=identity1
+ * Usage:
+ *   mcp-router \
+ *     --args server --args start --args --namespace --args kusto \
+ *     --env AZURE_TENANT_ID=abc123 \
+ *     --router 'kusto_*.cluster_uri="https://cluster1.kusto.windows.net"; AZURE_CLIENT_ID="id1"' \
+ *     --router 'kusto_*.cluster_uri="https://cluster2.kusto.windows.net"; AZURE_CLIENT_ID="id2"'
  *
- * 2. Config file (multiple groups):
- *    mcp-router --config router-config.json
- *
- * The server communicates over stdio (stdin/stdout) using the MCP protocol.
- * Logs are written to stderr.
+ * --router spec format:
+ *   toolPattern.injectParam="injectValue"[; ENV_KEY="envValue"]...
  */
 
-import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import { DownstreamManager } from './downstream-manager.js';
 import { ToolRouter } from './tool-router.js';
-import { HealthMonitor } from './health-monitor.js';
+
 import { createAndStartServer } from './server.js';
 import { registerShutdownHandlers } from './lifecycle.js';
 import { logger, setLogLevel, enableFileLogging } from './logger.js';
-import type { DownstreamMapping, DownstreamGroupConfig, RouterConfig } from './types.js';
+import { parseRouterSpec } from './router-parser.js';
+import type { RouterEntry, RouterConfig } from './types.js';
 
 /**
- * Parse a --mapping value: "key=identity" or "key" (no identity).
+ * Collect --env KEY=VALUE values into a Record.
  */
-export function parseMapping(value: string, previous: DownstreamMapping[]): DownstreamMapping[] {
-    const eqIndex = value.indexOf('=');
-    let key: string;
-    let identity: string;
-
-    if (eqIndex === -1) {
-        // No identity — use default
-        key = value;
-        identity = '';
-    } else {
-        key = value.substring(0, eqIndex);
-        identity = value.substring(eqIndex + 1);
+function collectEnv(value: string, previous: Record<string, string>): Record<string, string> {
+    const eqIdx = value.indexOf('=');
+    if (eqIdx < 1) {
+        logger.error(`Invalid --env value: "${value}". Expected format: KEY=VALUE`);
+        process.exit(1);
     }
+    const key = value.slice(0, eqIdx);
+    const val = value.slice(eqIdx + 1);
+    return { ...previous, [key]: val };
+}
 
-    if (!key) {
-        throw new Error(`Invalid mapping: "${value}". Expected format: key=identity or key`);
+/**
+ * Collect --router values into an array (used as commander's collect callback).
+ */
+function collectRouter(value: string, previous: RouterEntry[]): RouterEntry[] {
+    try {
+        previous.push(parseRouterSpec(value));
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logger.error(`Invalid --router spec: ${msg}`);
+        process.exit(1);
     }
-
-    previous.push({ key, identity });
     return previous;
 }
 
 /**
- * Load and validate a config file.
+ * Collect --args tokens into a string array (one raw token per flag).
  */
-function loadConfigFile(configPath: string): RouterConfig {
-    const raw = readFileSync(configPath, 'utf-8');
-    const parsed = JSON.parse(raw);
-
-    if (!parsed.groups || !Array.isArray(parsed.groups) || parsed.groups.length === 0) {
-        throw new Error('Config file must contain a non-empty "groups" array.');
-    }
-
-    for (const group of parsed.groups) {
-        if (!group.namespace) {
-            throw new Error('Each group must have a "namespace" field.');
-        }
-        if (!group.routingKey) {
-            throw new Error(`Group "${group.namespace}" must have a "routingKey" field.`);
-        }
-        if (!group.downstreams || !Array.isArray(group.downstreams) || group.downstreams.length === 0) {
-            throw new Error(`Group "${group.namespace}" must have a non-empty "downstreams" array.`);
-        }
-        for (const ds of group.downstreams) {
-            if (!ds.key) {
-                throw new Error(`Each downstream in group "${group.namespace}" must have a "key" field.`);
-            }
-            if (ds.identity === undefined) {
-                ds.identity = '';
-            }
-        }
-    }
-
-    return {
-        groups: parsed.groups as DownstreamGroupConfig[],
-        pingIntervalSeconds: parsed.pingIntervalSeconds ?? 60,
-        pingTimeoutSeconds: parsed.pingTimeoutSeconds ?? 10,
-        maxReconnectBackoffSeconds: parsed.maxReconnectBackoffSeconds ?? 300,
-        logLevel: parsed.logLevel ?? 'info',
-    };
+function collectPassthroughArg(value: string, previous: string[]): string[] {
+    previous.push(value);
+    return previous;
 }
 
 async function main(): Promise<void> {
@@ -100,57 +70,39 @@ async function main(): Promise<void> {
     program
         .name('mcp-router')
         .description(
-            'Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances'
+            'Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances. ' +
+            'Drop-in replacement for @azure/mcp with multi-target routing via --router.'
         )
         .version('1.0.0')
+        // ── Passthrough args ───────────────────────────────────────────────────
         .option(
-            '--config <path>',
-            'Path to a JSON config file defining downstream groups'
+            '--args <token>',
+            'A single argument token forwarded verbatim to each child @azure/mcp process. ' +
+            'Repeatable — one flag per token. ' +
+            'Example: --args server --args start --args --namespace --args kusto',
+            collectPassthroughArg,
+            [] as string[]
+        )
+        // ── Router-specific args ───────────────────────────────────────────────
+        .option(
+            '--env <KEY=VALUE>',
+            'Environment variable applied to ALL child MCP processes. Repeatable. ' +
+            'Example: --env AZURE_TENANT_ID=abc123',
+            collectEnv,
+            {} as Record<string, string>
         )
         .option(
-            '--namespace <namespace>',
-            '@azure/mcp namespace for CLI mode (e.g. "kusto", "cosmos")',
-            'kusto'
+            '--router <spec>',
+            'Routing target spec: toolPattern.injectParam="value"[; ENV_KEY="val"]. ' +
+            'Repeatable — one per routing target. Example: kusto_*.cluster_uri="https://cluster1.kusto.windows.net"; AZURE_CLIENT_ID="abc123"',
+            collectRouter,
+            [] as RouterEntry[]
         )
+        // ── Meta options ───────────────────────────────────────────────────────
         .option(
-            '--routing-key <key>',
-            'Tool schema property name used for routing (e.g. "cluster-uri", "account")',
-            'cluster-uri'
-        )
-        .option(
-            '--forward-key-as <key>',
-            'Rename the routing key when forwarding to the downstream. ' +
-            'E.g., --routing-key account --forward-key-as accountName'
-        )
-        .option(
-            '--mapping <mapping>',
-            'Downstream mapping in format "key=identity" (CLI mode). ' +
-            'Can be specified multiple times. ' +
-            'If identity is omitted, uses the default managed identity.',
-            parseMapping,
-            [] as DownstreamMapping[]
-        )
-        .option(
-            '--mode <mode>',
-            '@azure/mcp --mode value (CLI mode)',
-            'all'
-        )
-        .option('--read-only', 'Run downstream MCPs in read-only mode (CLI mode)', true)
-        .option('--no-read-only', 'Allow write operations on downstream MCPs')
-        .option(
-            '--ping-interval <seconds>',
-            'Health check ping interval in seconds',
-            '60'
-        )
-        .option(
-            '--ping-timeout <seconds>',
-            'Health check ping timeout in seconds',
-            '10'
-        )
-        .option(
-            '--max-reconnect-backoff <seconds>',
-            'Maximum reconnection backoff in seconds',
-            '300'
+            '--mcp-version <version>',
+            'Version of @azure/mcp to use when spawning child processes (e.g. "latest", "1.2.3"). Defaults to "latest".',
+            'latest'
         )
         .option(
             '--log-level <level>',
@@ -161,86 +113,59 @@ async function main(): Promise<void> {
 
     const opts = program.opts();
 
-    let config: RouterConfig;
+    const entries = opts.router as RouterEntry[];
 
-    if (opts.config) {
-        // Config file mode — load from JSON
-        try {
-            config = loadConfigFile(opts.config as string);
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            logger.error(`Failed to load config file: ${msg}`);
-            process.exit(1);
-        }
-
-        // CLI overrides for log level and health settings
-        if (opts.logLevel !== 'info') {
-            config.logLevel = opts.logLevel as RouterConfig['logLevel'];
-        }
-    } else {
-        // CLI flags mode — build a single group from flags
-        const mappings = opts.mapping as DownstreamMapping[];
-
-        if (mappings.length === 0) {
-            logger.error(
-                'No downstream mappings provided. Use --mapping or --config.'
-            );
-            process.exit(1);
-        }
-
-        const group: DownstreamGroupConfig = {
-            namespace: opts.namespace as string,
-            routingKey: opts.routingKey as string,
-            forwardKeyAs: opts.forwardKeyAs as string | undefined,
-            mode: opts.mode as string,
-            readOnly: opts.readOnly as boolean,
-            downstreams: mappings,
-        };
-
-        config = {
-            groups: [group],
-            pingIntervalSeconds: parseInt(opts.pingInterval as string, 10),
-            pingTimeoutSeconds: parseInt(opts.pingTimeout as string, 10),
-            maxReconnectBackoffSeconds: parseInt(opts.maxReconnectBackoff as string, 10),
-            logLevel: opts.logLevel as RouterConfig['logLevel'],
-        };
+    if (entries.length === 0) {
+        logger.error(
+            'No routing targets provided. Use --router to specify at least one routing target. ' +
+            'Example: --router kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc"'
+        );
+        process.exit(1);
     }
 
-    setLogLevel(config.logLevel);
+    const logLevel = opts.logLevel as RouterConfig['logLevel'];
+    setLogLevel(logLevel);
     enableFileLogging();
 
+    const passthroughArgs = opts.args as string[];
+
+    const mcpVersion = (opts.mcpVersion as string) || 'latest';
+
+    const config: RouterConfig = {
+        entries,
+        passthroughArgs,
+        globalEnv: opts.env as Record<string, string>,
+        mcpVersion,
+        logLevel,
+    };
+
     logger.info('Starting MCP Router', {
-        groups: config.groups.map((g) => ({
-            namespace: g.namespace,
-            routingKey: g.routingKey,
-            downstreams: g.downstreams.map((d) => d.key),
+        passthroughArgs,
+        routerEntries: entries.map((e) => ({
+            toolPattern: e.toolPattern,
+            injectParam: e.injectParam,
+            injectValue: e.injectValue,
+            envOverrideKeys: Object.keys(e.envOverrides),
         })),
-        pingIntervalSeconds: config.pingIntervalSeconds,
     });
 
-    // 1. Initialize all downstream @azure/mcp instances
+    // 1. Probe tool schemas from the first entry downstream (eager for schema discovery)
     const downstreamManager = new DownstreamManager(config);
-    await downstreamManager.initializeAll();
+    const baseTools = await downstreamManager.probeToolSchemas();
 
-    const connectedCount = downstreamManager
-        .getConnections()
-        .filter((c) => c.status === 'Connected').length;
-
-    if (connectedCount === 0) {
-        logger.error(
-            'No downstream MCP servers could be connected. Exiting.'
-        );
+    if (baseTools.length === 0) {
+        logger.error('No tools discovered from probe downstream. Exiting.');
         await downstreamManager.shutdownAll();
         process.exit(1);
     }
 
     // 2. Build the merged tool list
-    const toolRouter = new ToolRouter(downstreamManager);
-    toolRouter.refreshTools();
+    const toolRouter = new ToolRouter(downstreamManager, entries);
+    toolRouter.refreshTools(baseTools);
 
     const tools = toolRouter.getTools();
     if (tools.length === 0) {
-        logger.error('No tools discovered from any downstream. Exiting.');
+        logger.error('No tools in merged list. Exiting.');
         await downstreamManager.shutdownAll();
         process.exit(1);
     }
@@ -248,22 +173,16 @@ async function main(): Promise<void> {
     // 3. Start the MCP server over stdio
     const { server, transport } = await createAndStartServer(toolRouter);
 
-    // 4. Start health monitoring
-    const healthMonitor = new HealthMonitor(downstreamManager, config);
-    healthMonitor.start();
-
-    // 5. Register shutdown handlers
+    // 4. Register shutdown handlers
     registerShutdownHandlers({
         downstreamManager,
-        healthMonitor,
         server,
         transport,
     });
 
     logger.info('MCP Router is ready', {
-        downstreams: downstreamManager.getDownstreamKeys(),
         tools: tools.map((t) => t.name),
-        connectedDownstreams: connectedCount,
+        routerEntries: entries.length,
     });
 }
 
