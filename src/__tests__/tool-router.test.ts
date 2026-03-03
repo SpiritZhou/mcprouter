@@ -73,7 +73,6 @@ const SAMPLE_TOOLS: ToolDefinition[] = [
 
 function createMockDownstreamManager(): DownstreamManager {
     return {
-        getEntries: vi.fn(() => KUSTO_ENTRIES),
         callTool: vi.fn(async (_entry: RouterEntry, _tool: string, _args: Record<string, unknown>): Promise<ToolCallResult> => ({
             content: [{ type: 'text', text: 'mock result' }],
             isError: false,

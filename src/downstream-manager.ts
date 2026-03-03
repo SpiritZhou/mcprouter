@@ -23,7 +23,6 @@ import type { ChildProcess } from 'node:child_process';
 import type {
     RouterEntry,
     ConnectionStatus,
-    DownstreamConnection,
     RouterConfig,
     ToolCallResult,
     ToolDefinition,
@@ -45,13 +44,6 @@ interface DownstreamState {
     consecutiveFailures: number;
     tools: ToolDefinition[];
     reconnecting: boolean;
-}
-
-/**
- * Normalizes a string key for consistent matching (trim + lowercase).
- */
-export function normalizeKey(key: string): string {
-    return key.trim().toLowerCase();
 }
 
 export class DownstreamManager {
@@ -232,7 +224,7 @@ export class DownstreamManager {
     /**
      * Reconnect a failed/disconnected downstream by key.
      */
-    async reconnect(key: string): Promise<boolean> {
+    private async reconnect(key: string): Promise<boolean> {
         const state = this._downstreams.get(key);
         if (!state) {
             logger.error('Cannot reconnect: unknown downstream', { key });
@@ -420,42 +412,6 @@ export class DownstreamManager {
         }
 
         return { content: mergedContent, isError: hasError };
-    }
-
-    /**
-     * Get all active (already-created) downstream connections.
-     * Excludes entries that have never been instantiated (lazy).
-     */
-    getConnections(): DownstreamConnection[] {
-        return [...this._downstreams.values()].map((state) => ({
-            key: state.key,
-            entrySpec: `${state.entry.injectParam}=${state.entry.injectValue}`,
-            status: state.status,
-            lastHeartbeat: state.lastHeartbeat,
-            consecutiveFailures: state.consecutiveFailures,
-            tools: state.tools,
-        }));
-    }
-
-    /**
-     * Get all active downstream keys (hashes of created instances only).
-     */
-    getActiveKeys(): string[] {
-        return [...this._downstreams.keys()];
-    }
-
-    /**
-     * Get all RouterEntries configured for this manager.
-     */
-    getEntries(): RouterEntry[] {
-        return this._config.entries;
-    }
-
-    /**
-     * Get the connection status of a specific downstream by key.
-     */
-    getStatus(key: string): ConnectionStatus | null {
-        return this._downstreams.get(key)?.status ?? null;
     }
 
     /**

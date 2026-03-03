@@ -33,24 +33,6 @@ export interface RouterEntry {
 export type ConnectionStatus = 'Connected' | 'Connecting' | 'Failed' | 'Disconnected';
 
 /**
- * Represents a downstream @azure/mcp server instance (public view).
- */
-export interface DownstreamConnection {
-    /** Hash-based key uniquely identifying this downstream */
-    key: string;
-    /** Human-readable spec: "injectParam=injectValue" */
-    entrySpec: string;
-    /** Current connection status */
-    status: ConnectionStatus;
-    /** ISO 8601 timestamp of last successful heartbeat */
-    lastHeartbeat: string | null;
-    /** Consecutive ping failures */
-    consecutiveFailures: number;
-    /** Tools discovered from this downstream */
-    tools: ToolDefinition[];
-}
-
-/**
  * MCP tool definition as returned by tools/list.
  */
 export interface ToolDefinition {
