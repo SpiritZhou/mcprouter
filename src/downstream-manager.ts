@@ -423,50 +423,8 @@ export class DownstreamManager {
     }
 
     /**
-<<<<<<< Updated upstream
      * Get all active (already-created) downstream connections.
      * Excludes entries that have never been instantiated (lazy).
-=======
-     * Get all configured downstream keys.
-     */
-    getDownstreamKeys(): string[] {
-        return [...this._downstreams.keys()];
-    }
-
-    /**
-     * Get the routing key property name. All groups must use the same routing key
-     * for the current single-router model; returns the first group's routing key.
-     */
-    getRoutingKey(): string {
-        if (this._config.groups.length > 0) {
-            return this._config.groups[0]!.routingKey;
-        }
-        return 'cluster-uri'; // fallback default — matches @azure/mcp kusto tool schema
-    }
-
-    /**
-     * Get the forwardKeyAs property name. When forwarding the routing key value
-     * to the downstream, use this name instead of the routing key.
-     *
-     * Returns the routing key if no override is configured.
-     */
-    getForwardKeyAs(): string {
-        if (this._config.groups.length > 0) {
-            const group = this._config.groups[0]!;
-
-            // Explicit config takes priority
-            if (group.forwardKeyAs) {
-                return group.forwardKeyAs;
-            }
-
-            return group.routingKey;
-        }
-        return this.getRoutingKey();
-    }
-
-    /**
-     * Get the connection info for all downstreams.
->>>>>>> Stashed changes
      */
     getConnections(): DownstreamConnection[] {
         return [...this._downstreams.values()].map((state) => ({
