@@ -136,6 +136,13 @@ export class DownstreamManager {
         const childArgs = ['-y', mcpPkg, ...this._config.passthroughArgs];
 
         // Build environment for the child process
+        logger.info('Building downstream env', {
+            key,
+            processEnvAZURE_TOKEN_CREDENTIALS: process.env['AZURE_TOKEN_CREDENTIALS'] ?? '(not set)',
+            globalEnv: JSON.stringify(this._config.globalEnv),
+            entryEnvOverrides: JSON.stringify(entry.envOverrides),
+        });
+
         const env: Record<string, string> = {
             ...(process.env as Record<string, string>),
             AZURE_TOKEN_CREDENTIALS:
@@ -151,6 +158,7 @@ export class DownstreamManager {
 
         // Apply global env vars from --env (shared across all downstreams)
         for (const [k, v] of Object.entries(this._config.globalEnv)) {
+            logger.info('Applying globalEnv override', { key, envKey: k, envValue: v });
             env[k] = v;
         }
 
@@ -160,16 +168,18 @@ export class DownstreamManager {
             logger.debug('Applying per-entry env override for downstream', { key, envKey: k });
         }
 
+        logger.info('Final resolved env for downstream', {
+            key,
+            AZURE_TOKEN_CREDENTIALS: env['AZURE_TOKEN_CREDENTIALS'] ?? '(not set)',
+            AZURE_CLIENT_ID: env['AZURE_CLIENT_ID'] ?? '(not set)',
+            IDENTITY_ENDPOINT: env['IDENTITY_ENDPOINT'] ?? '(not set)',
+            IDENTITY_HEADER: env['IDENTITY_HEADER'] ?? '(not set)',
+        });
+
         logger.info('Spawning downstream MCP process', {
             key,
             command: 'npx',
             args: childArgs,
-            env: {
-                AZURE_TOKEN_CREDENTIALS: env['AZURE_TOKEN_CREDENTIALS'] ?? '(not set)',
-                AZURE_CLIENT_ID: env['AZURE_CLIENT_ID'] ?? '(not set)',
-                IDENTITY_ENDPOINT: env['IDENTITY_ENDPOINT'] ?? '(not set)',
-                IDENTITY_HEADER: env['IDENTITY_HEADER'] ?? '(not set)',
-            },
         });
 
         const transport = new StdioClientTransport({
