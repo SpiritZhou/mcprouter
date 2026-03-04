@@ -373,6 +373,7 @@ export class DownstreamManager {
         toolName: string,
         args: Record<string, unknown>
     ): Promise<ToolCallResult> {
+        logger.info('callTool default');
         return this.callTool(DEFAULT_ENTRY, toolName, args);
     }
 
