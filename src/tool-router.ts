@@ -75,14 +75,14 @@ export class ToolRouter {
                 logger.debug('Routing by injectParam', { tool: toolName, [injectParam]: matched.injectValue });
                 return this._downstreamManager.callTool(matched, toolName, args);
             }
+            // Value provided but not in any configured entry — fall back to default downstream
             const available = matchingEntries.map((e) => e.injectValue).join(', ');
-            return {
-                content: [{
-                    type: 'text',
-                    text: `Error: "${injectValue}" is not a configured ${injectParam}. Available: ${available}`,
-                }],
-                isError: true,
-            };
+            logger.info('No entry matched injectParam value, falling back to default downstream', {
+                tool: toolName,
+                [injectParam]: injectValue,
+                available,
+            });
+            return this._downstreamManager.callDefault(toolName, args);
         }
 
         if (matchingEntries.length === 1) {

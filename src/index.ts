@@ -116,11 +116,10 @@ async function main(): Promise<void> {
     const entries = opts.router as RouterEntry[];
 
     if (entries.length === 0) {
-        logger.error(
-            'No routing targets provided. Use --router to specify at least one routing target. ' +
-            'Example: --router kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc"'
+        logger.info(
+            'No --router targets provided. Running in pass-through mode: ' +
+            'all tool calls will be forwarded to a single default downstream using the provided --args.'
         );
-        process.exit(1);
     }
 
     const logLevel = opts.logLevel as RouterConfig['logLevel'];

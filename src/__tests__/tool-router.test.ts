@@ -152,14 +152,17 @@ describe('ToolRouter', () => {
             expect(result.isError).toBeFalsy();
         });
 
-        it('returns error when inject value is unknown', async () => {
+        it('falls back to default downstream when inject value is unknown', async () => {
             const result = await router.routeCall('kusto_query', {
                 cluster_uri: 'https://unknown.kusto.windows.net',
                 database: 'mydb',
                 query: 'T | take 10',
             });
-            expect(result.isError).toBe(true);
-            expect(result.content[0]!.text).toContain('not a configured');
+            expect(mockManager.callDefault).toHaveBeenCalledWith(
+                'kusto_query',
+                { cluster_uri: 'https://unknown.kusto.windows.net', database: 'mydb', query: 'T | take 10' }
+            );
+            expect(result.isError).toBeFalsy();
         });
 
         it('fans out when inject param is missing', async () => {
