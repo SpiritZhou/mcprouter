@@ -57,7 +57,7 @@ export class ToolRouter {
 
         if (matchingEntries.length === 0) {
             // No pattern matches — call the default downstream (plain @azure/mcp, no inject)
-            logger.debug('No pattern match, routing to default downstream', { tool: toolName });
+            logger.info('No pattern match, routing to default downstream', { tool: toolName });
             return this._downstreamManager.callDefault(toolName, args);
         }
 
@@ -72,7 +72,7 @@ export class ToolRouter {
                 (e) => e.injectValue.trim().toLowerCase() === normalizedValue
             );
             if (matched) {
-                logger.debug('Routing by injectParam', { tool: toolName, [injectParam]: matched.injectValue });
+                logger.info('Routing by injectParam', { tool: toolName, [injectParam]: matched.injectValue });
                 return this._downstreamManager.callTool(matched, toolName, args);
             }
             // Value provided but not in any configured entry — fall back to default downstream
@@ -88,7 +88,7 @@ export class ToolRouter {
         if (matchingEntries.length === 1) {
             // Auto-inject the single configured value
             const entry = matchingEntries[0]!;
-            logger.debug('Auto-injecting single entry', { tool: toolName, [injectParam]: entry.injectValue });
+            logger.info('Auto-injecting single entry', { tool: toolName, [injectParam]: entry.injectValue });
             const forwardArgs = { ...args, [injectParam]: entry.injectValue };
             return this._downstreamManager.callTool(entry, toolName, forwardArgs);
         }
