@@ -9,13 +9,13 @@
  */
 
 import type { DownstreamManager } from './downstream-manager.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { logger } from './logger.js';
 
 interface LifecycleComponents {
     downstreamManager: DownstreamManager;
-    server: McpServer;
+    server: Server;
     transport: StdioServerTransport;
 }
 
