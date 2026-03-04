@@ -35,14 +35,14 @@ export async function createAndStartServer(toolRouter: ToolRouter): Promise<{
     // tools/list — forward tool definitions directly from the router (JSON Schema, no conversion)
     server.setRequestHandler(ListToolsRequestSchema, () => {
         const tools = toolRouter.getTools();
-        logger.debug('tools/list request', { toolCount: tools.length });
+        logger.info('tools/list request', { toolCount: tools.length });
         return { tools };
     });
 
     // tools/call — route to the appropriate downstream
     server.setRequestHandler(CallToolRequestSchema, async (req) => {
         const { name, arguments: args } = req.params;
-        logger.debug('tools/call request', { tool: name, args: Object.keys(args ?? {}) });
+        logger.info('tools/call request', { tool: name, args: Object.keys(args ?? {}) });
 
         const result = await toolRouter.routeCall(name, (args ?? {}) as Record<string, unknown>);
         return {
