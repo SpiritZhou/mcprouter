@@ -139,7 +139,7 @@ async function main(): Promise<void> {
     };
 
     logger.info('Starting MCP Router', {
-        version: '1.0.0',
+        version: '1.0.1',
         passthroughArgs,
         routerEntries: entries.map((e) => ({
             toolPattern: e.toolPattern,
