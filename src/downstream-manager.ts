@@ -302,7 +302,7 @@ export class DownstreamManager {
     ): Promise<ToolCallResult> {
         let state = await this.getOrCreateDownstream(entry);
         const key = state.key;
-
+        logger.info('callTool called', { key, toolName, args });
         // If the downstream went away (process crashed), attempt one inline reconnect
         if (!state.client || state.status !== 'Connected') {
             logger.info('Downstream not connected, attempting inline reconnect', {
