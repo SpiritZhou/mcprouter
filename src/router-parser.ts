@@ -5,7 +5,7 @@
  *   toolPattern.injectParam="injectValue"[; ENV_KEY="envValue"]...
  *
  * Examples:
- *   kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"
+ *   kusto_*.cluster-uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"
  *   cosmos_*.account="myaccount"; AZURE_CLIENT_ID="xyz"; AZURE_TENANT_ID="tenant1"
  *   *    (any tool, no additional env)  — not typical but valid if no env overrides are needed
  */
@@ -39,7 +39,7 @@ export function parseRouterSpec(spec: string): RouterEntry {
     if (!firstMatch) {
         throw new Error(
             `Invalid --router spec first segment: "${firstSeg}". ` +
-            `Expected: toolPattern.param="value" (e.g. kusto_*.cluster_uri="https://...")`
+            `Expected: toolPattern.param="value" (e.g. kusto_*.cluster-uri="https://...")`
         );
     }
 
@@ -65,16 +65,17 @@ export function parseRouterSpec(spec: string): RouterEntry {
 }
 
 /**
- * Compute a stable, short (16-char hex) hash key for a RouterEntry + passthroughArgs combo.
- * The injectValue is always unique per downstream, so envOverrides are not included in the hash.
+ * Compute a stable, short (16-char hex) hash key for a downstream child process.
+ * The key is derived from passthroughArgs and the final resolved env (only explicitly-specified keys).
  *
- * Key format: sha256(passthroughArgs|injectParam=injectValue)[:16]
+ * Key format: sha256(passthroughArgs | sorted KEY=VALUE pairs)[:16]
  */
-export function computeDownstreamKey(passthroughArgs: string[], entry: RouterEntry): string {
-    const data = [
-        passthroughArgs.join(' '),
-        `${entry.injectParam}=${entry.injectValue}`,
-    ].join('|');
+export function computeDownstreamKey(passthroughArgs: string[], resolvedEnv: Record<string, string>): string {
+    const sortedEnv = Object.keys(resolvedEnv)
+        .sort()
+        .map((k) => `${k}=${resolvedEnv[k]}`)
+        .join(',');
+    const data = [passthroughArgs.join(' '), sortedEnv].join('|');
 
     return createHash('sha256').update(data).digest('hex').slice(0, 16);
 }

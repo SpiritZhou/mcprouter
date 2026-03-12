@@ -4,7 +4,7 @@
  *
  * Ensures:
  * 1. MCP server transport is closed
- * 2. All downstream child processes are terminated (SIGTERM, then SIGKILL after 5s)
+ * 2. All downstream child processes are terminated (SIGTERM, then SIGKILL after 1s)
  * 3. Process exits cleanly
  */
 
@@ -25,13 +25,13 @@ let shutdownInProgress = false;
  * Register signal and stdin handlers for graceful shutdown.
  */
 export function registerShutdownHandlers(components: LifecycleComponents): void {
-    const shutdown = async (signal: string): Promise<void> => {
+    const shutdown = async (signal: string, force: boolean): Promise<void> => {
         if (shutdownInProgress) {
             return;
         }
         shutdownInProgress = true;
 
-        logger.info(`Received ${signal}, shutting down gracefully...`);
+        logger.info(`Received ${signal}, shutting down${force ? ' (forced)' : ''}...`);
 
         try {
             // 1. Close MCP server transport
@@ -42,9 +42,9 @@ export function registerShutdownHandlers(components: LifecycleComponents): void 
             }
 
             // 2. Shut down all downstream connections
-            await components.downstreamManager.shutdownAll();
+            await components.downstreamManager.shutdownAll(force);
 
-            logger.info('Graceful shutdown complete');
+            logger.info('Shutdown complete');
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             logger.error('Error during shutdown', { error: msg });
@@ -53,14 +53,17 @@ export function registerShutdownHandlers(components: LifecycleComponents): void 
         process.exit(0);
     };
 
-    // Signal handlers
-    process.on('SIGINT', () => void shutdown('SIGINT'));
-    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    // Signal handlers — SIGTERM/SIGINT get graceful shutdown
+    process.on('SIGINT', () => void shutdown('SIGINT', false));
+    process.on('SIGTERM', () => void shutdown('SIGTERM', false));
 
-    // stdin close — the parent process (Session.Proxy) closed the pipe
+    // stdin close — the parent process (Session.Proxy) closed the pipe,
+    // which typically means it's about to SIGKILL the entire process tree.
+    // Use forced shutdown (SIGKILL children immediately) to avoid racing
+    // with the parent's kill.
     process.stdin.on('close', () => {
         logger.info('stdin closed (parent disconnected)');
-        void shutdown('stdin-close');
+        void shutdown('stdin-close', true);
     });
 
     // Handle uncaught errors
@@ -69,7 +72,7 @@ export function registerShutdownHandlers(components: LifecycleComponents): void 
             error: error.message,
             stack: error.stack,
         });
-        void shutdown('uncaughtException');
+        void shutdown('uncaughtException', false);
     });
 
     process.on('unhandledRejection', (reason) => {

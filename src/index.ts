@@ -3,16 +3,17 @@
 /**
  * @sreagent/mcp-router
  *
- * Generic MCP server that routes tool calls to multiple downstream @azure/mcp
+ * Generic MCP server that routes tool calls to multiple downstream MCP
  * instances. All child process arguments are forwarded verbatim via --args
- * (one token per flag), making any future @azure/mcp CLI changes transparent.
+ * (one token per flag), making any future downstream CLI changes transparent.
  *
  * Usage:
  *   mcp-router \
+ *     --args npx --args -y --args @azure/mcp@latest \
  *     --args server --args start --args --namespace --args kusto \
  *     --env AZURE_TENANT_ID=abc123 \
- *     --router 'kusto_*.cluster_uri="https://cluster1.kusto.windows.net"; AZURE_CLIENT_ID="id1"' \
- *     --router 'kusto_*.cluster_uri="https://cluster2.kusto.windows.net"; AZURE_CLIENT_ID="id2"'
+ *     --router 'kusto_*.cluster-uri="https://cluster1.kusto.windows.net"; AZURE_CLIENT_ID="id1"'
+ *     --router 'kusto_*.cluster-uri="https://cluster2.kusto.windows.net"; AZURE_CLIENT_ID="id2"'
  *
  * --router spec format:
  *   toolPattern.injectParam="injectValue"[; ENV_KEY="envValue"]...
@@ -70,14 +71,14 @@ async function main(): Promise<void> {
     program
         .name('mcp-router')
         .description(
-            'Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances. ' +
-            'Drop-in replacement for @azure/mcp with multi-target routing via --router.'
+            'Generic MCP server that routes tool calls to multiple downstream MCP instances. ' +
+            'Drop-in replacement for a single MCP server with multi-target routing via --router.'
         )
         .version('1.0.0')
         // ── Passthrough args ───────────────────────────────────────────────────
         .option(
             '--args <token>',
-            'A single argument token forwarded verbatim to each child @azure/mcp process. ' +
+            'A single argument token forwarded verbatim to each child MCP process. ' +
             'Repeatable — one flag per token. ' +
             'Example: --args server --args start --args --namespace --args kusto',
             collectPassthroughArg,
@@ -86,7 +87,8 @@ async function main(): Promise<void> {
         // ── Router-specific args ───────────────────────────────────────────────
         .option(
             '--env <KEY=VALUE>',
-            'Environment variable applied to ALL child MCP processes. Repeatable. ' +
+            'Environment variable applied to ALL child MCP processes (lowest priority — ' +
+            'overridden by mcp-router own env, then by per-router ENV_KEY). Repeatable. ' +
             'Example: --env AZURE_TENANT_ID=abc123',
             collectEnv,
             {} as Record<string, string>
@@ -99,11 +101,6 @@ async function main(): Promise<void> {
             [] as RouterEntry[]
         )
         // ── Meta options ───────────────────────────────────────────────────────
-        .option(
-            '--mcp-version <version>',
-            'Version of @azure/mcp to use when spawning child processes (e.g. "latest", "1.2.3"). Defaults to "latest".',
-            'latest'
-        )
         .option(
             '--log-level <level>',
             'Log level (debug, info, warn, error)',
@@ -128,18 +125,14 @@ async function main(): Promise<void> {
 
     const passthroughArgs = opts.args as string[];
 
-    const mcpVersion = (opts.mcpVersion as string) || 'latest';
-
     const config: RouterConfig = {
         entries,
         passthroughArgs,
         globalEnv: opts.env as Record<string, string>,
-        mcpVersion,
         logLevel,
     };
 
     logger.info('Starting MCP Router', {
-        version: '1.0.1',
         passthroughArgs,
         routerEntries: entries.map((e) => ({
             toolPattern: e.toolPattern,

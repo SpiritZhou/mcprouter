@@ -23,6 +23,7 @@ export class ToolRouter {
     private readonly _downstreamManager: DownstreamManager;
     private readonly _entries: RouterEntry[];
     private _tools: ToolDefinition[] = [];
+    private _probePromise: Promise<ToolDefinition[]> | null = null;
 
     constructor(downstreamManager: DownstreamManager, entries: RouterEntry[]) {
         this._downstreamManager = downstreamManager;
@@ -48,6 +49,40 @@ export class ToolRouter {
     }
 
     /**
+     * Lazily probe downstream tool schemas on first call, then return cached.
+     * Concurrent callers share the same probe promise to avoid duplicate spawns.
+     */
+    async lazyGetTools(): Promise<ToolDefinition[]> {
+        if (this._tools.length > 0) {
+            return this._tools;
+        }
+
+        if (!this._probePromise) {
+            this._probePromise = this._probeAndCache();
+        }
+
+        return this._probePromise;
+    }
+
+    private async _probeAndCache(): Promise<ToolDefinition[]> {
+        try {
+            const tools = await this._downstreamManager.probeToolSchemas();
+            if (tools.length > 0) {
+                this.refreshTools(tools);
+            } else {
+                logger.warn('Probe returned no tools — tools/list will be empty until retry');
+                this._probePromise = null; // allow retry on next call
+            }
+            return this._tools;
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            logger.error('Failed to probe tool schemas', { error: msg });
+            this._probePromise = null; // allow retry on next call
+            return [];
+        }
+    }
+
+    /**
      * Route a tools/call request to the appropriate downstream(s).
      */
     async routeCall(toolName: string, args: Record<string, unknown>): Promise<ToolCallResult> {
@@ -56,14 +91,17 @@ export class ToolRouter {
         );
 
         if (matchingEntries.length === 0) {
-            // No pattern matches — call the default downstream (plain @azure/mcp, no inject)
-            logger.info('No pattern match, routing to default downstream', { tool: toolName });
+            // No pattern matches — call the default downstream (no inject)
+            logger.debug('No pattern match, routing to default downstream', { tool: toolName });
             return this._downstreamManager.callDefault(toolName, args);
         }
 
         // All matching entries are expected to share the same injectParam
         const injectParam = matchingEntries[0]!.injectParam;
-        const injectValue = args[injectParam] as string | undefined;
+        const rawInjectValue = args[injectParam];
+        // Coerce non-string primitives (number, boolean) to string for routing;
+        // LLMs may emit typed JSON values instead of strings.
+        const injectValue = rawInjectValue != null ? String(rawInjectValue) : undefined;
 
         if (injectValue) {
             // Route to the specific downstream matching the provided injectValue
@@ -72,7 +110,7 @@ export class ToolRouter {
                 (e) => e.injectValue.trim().toLowerCase() === normalizedValue
             );
             if (matched) {
-                logger.info('Routing by injectParam', { tool: toolName, [injectParam]: matched.injectValue });
+                logger.debug('Routing by injectParam', { tool: toolName, [injectParam]: matched.injectValue });
                 return this._downstreamManager.callTool(matched, toolName, args);
             }
             // Value provided but not in any configured entry — fall back to default downstream
@@ -88,7 +126,7 @@ export class ToolRouter {
         if (matchingEntries.length === 1) {
             // Auto-inject the single configured value
             const entry = matchingEntries[0]!;
-            logger.info('Auto-injecting single entry', { tool: toolName, [injectParam]: entry.injectValue });
+            logger.debug('Auto-injecting single entry', { tool: toolName, [injectParam]: entry.injectValue });
             const forwardArgs = { ...args, [injectParam]: entry.injectValue };
             return this._downstreamManager.callTool(entry, toolName, forwardArgs);
         }

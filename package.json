@@ -1,7 +1,7 @@
 {
   "name": "@sreagent/mcp-router",
   "version": "1.0.0",
-  "description": "Generic MCP server that routes tool calls to multiple downstream @azure/mcp instances with configurable routing keys",
+  "description": "Generic MCP server that routes tool calls to multiple downstream MCP instances with configurable routing keys",
   "type": "module",
   "bin": {
     "mcp-router": "./dist/index.js"

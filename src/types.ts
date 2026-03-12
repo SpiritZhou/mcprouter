@@ -11,18 +11,18 @@
  *   toolPattern.injectParam="injectValue"; ENV_KEY="envValue"; ...
  *
  * Example:
- *   kusto_*.cluster_uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"
+ *   kusto_*.cluster-uri="https://mycluster.kusto.windows.net"; AZURE_CLIENT_ID="abc123"
  */
 export interface RouterEntry {
     /** Glob pattern matching tool names, e.g. "kusto_*" or "cosmos_*" */
     toolPattern: string;
-    /** Parameter name injected/matched for routing, e.g. "cluster_uri" */
+    /** Parameter name injected/matched for routing, e.g. "cluster-uri" */
     injectParam: string;
     /** The value associated with this routing target, e.g. "https://mycluster.kusto.windows.net" */
     injectValue: string;
     /**
      * Per-entry environment variable overrides applied to this downstream's child process.
-     * Layered on top of globalEnv. Typically used for per-identity vars like AZURE_CLIENT_ID.
+     * Highest priority — overrides both globalEnv and process.env. Typically used for per-identity vars like AZURE_CLIENT_ID.
      */
     envOverrides: Record<string, string>;
 }
@@ -91,20 +91,16 @@ export interface RouterConfig {
     /** Parsed --router entries, one per routing target */
     entries: RouterEntry[];
     /**
-     * Arguments forwarded verbatim to each child @azure/mcp process.
-     * E.g. ["server", "start", "--namespace", "kusto", "--mode", "all", "--read-only"]
+     * Command and arguments forwarded verbatim to each child MCP process.
+     * First token is the command, remaining tokens are its arguments.
+     * E.g. ["npx", "-y", "@azure/mcp@latest", "server", "start", "--namespace", "kusto"]
      */
     passthroughArgs: string[];
     /**
      * Environment variables from --env KEY=VALUE, applied to ALL child processes.
-     * Applied before per-entry envOverrides.
+     * Lowest priority — overridden by mcp-router's own process.env, then by per-router envOverrides.
      */
     globalEnv: Record<string, string>;
-    /**
-     * Version specifier for the @azure/mcp npm package used when spawning child processes.
-     * E.g. "latest", "1.2.3". Defaults to "latest".
-     */
-    mcpVersion: string;
     /** Log level */
     logLevel: 'debug' | 'info' | 'warn' | 'error';
 }
